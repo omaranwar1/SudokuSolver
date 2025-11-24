@@ -1319,3 +1319,4 @@ def draw_contour_and_corners(image, contour, corners):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
     return output
+    

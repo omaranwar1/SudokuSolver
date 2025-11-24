@@ -1,19 +1,4 @@
-"""
-Perspective Transformation Module
 
-This module handles the geometric transformation to straighten the Sudoku grid
-from a perspective (trapezoidal) view to a square orthogonal view.
-
-The perspective transform is essential for:
-- Normalizing the grid size for OCR
-- Removing perspective distortion from camera angle
-- Creating uniform cell sizes for digit extraction
-
-References:
-- Hartley & Zisserman, "Multiple View Geometry in Computer Vision" (2004)
-- Szeliski, "Computer Vision: Algorithms and Applications" (2010)
-- OpenCV Geometric Transformations: https://docs.opencv.org/4.x/da/d6e/tutorial_py_geometric_transformations.html
-"""
 
 import cv2
 import numpy as np
@@ -46,11 +31,10 @@ def perspective_transform(image, corners, output_size=450):
         - Hartley & Zisserman (2004), Chapter 4: "Estimation - 2D Projective Transformations"
         - Perspective transformation theory: https://en.wikipedia.org/wiki/Homography
     """
-    # Ensure corners are in the correct format
+   
     corners = corners.astype(np.float32)
 
-    # Define the destination points (perfect square)
-    # Order: [top-left, top-right, bottom-right, bottom-left]
+    
     destination_corners = np.array([
         [0, 0],  # Top-left
         [output_size - 1, 0],  # Top-right
@@ -58,15 +42,10 @@ def perspective_transform(image, corners, output_size=450):
         [0, output_size - 1]  # Bottom-left
     ], dtype=np.float32)
 
-    # Calculate the perspective transformation matrix
-    # This computes the 3x3 homography matrix H such that:
-    # destination = H * source (in homogeneous coordinates)
-    # The matrix is calculated using Direct Linear Transformation (DLT)
+   
     transform_matrix = cv2.getPerspectiveTransform(corners, destination_corners)
 
-    # Apply the perspective transformation
-    # INTER_LINEAR: bilinear interpolation (good balance of speed and quality)
-    # Other options: INTER_CUBIC (higher quality but slower), INTER_NEAREST (fastest but lower quality)
+   
     warped = cv2.warpPerspective(
         image,
         transform_matrix,
@@ -102,16 +81,16 @@ def straighten_grid(image, processed_image, output_size=450):
     """
     from .grid_detection import find_largest_contour, find_grid_corners
 
-    # Find the grid contour
+    
     contour = find_largest_contour(processed_image)
     if contour is None:
         print("Error: Could not find Sudoku grid in image")
         return None, None
 
-    # Find the four corners
+   
     corners = find_grid_corners(contour)
 
-    # Apply perspective transformation
+   
     straightened = perspective_transform(image, corners, output_size)
 
     return straightened, corners
@@ -138,7 +117,7 @@ def get_transform_quality_score(corners):
         This is useful for filtering out poor detections or warning users
         about potential quality issues.
     """
-    # Calculate side lengths
+   
     def distance(p1, p2):
         return np.sqrt(np.sum((p1 - p2) ** 2))
 
@@ -147,12 +126,12 @@ def get_transform_quality_score(corners):
     bottom = distance(corners[2], corners[3])
     left = distance(corners[3], corners[0])
 
-    # Calculate aspect ratios
+   
     horizontal_ratio = min(top, bottom) / max(top, bottom)
     vertical_ratio = min(left, right) / max(left, right)
     overall_ratio = min(top, bottom, left, right) / max(top, bottom, left, right)
 
-    # Average the ratios for final score
+   
     quality_score = (horizontal_ratio + vertical_ratio + overall_ratio) / 3.0
 
     return quality_score
@@ -207,7 +186,7 @@ def visualize_transformation(original, corners, transformed):
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
 
-    # Original with corners
+    
     original_viz = original.copy()
     corner_labels = ['TL', 'TR', 'BR', 'BL']
     colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]
@@ -218,7 +197,7 @@ def visualize_transformation(original, corners, transformed):
         cv2.putText(original_viz, label, (x + 15, y + 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-    # Draw lines between corners
+   
     for i in range(4):
         pt1 = tuple(corners[i].astype(int))
         pt2 = tuple(corners[(i + 1) % 4].astype(int))

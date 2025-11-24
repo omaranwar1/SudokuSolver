@@ -1,5 +1,6 @@
 """Image preprocessing utilities for Sudoku grid extraction."""
 
+
 import cv2
 import numpy as np
 from typing import Tuple, Optional

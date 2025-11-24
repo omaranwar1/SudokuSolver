@@ -10,18 +10,19 @@ This project implements a **Sudoku Solver** using Computer Vision techniques. Th
 ### Real-World Inspiration
 
 This project is inspired by the 2009 iPhone application **"Sudoku Grab"** by Kevin Gibbon.
-
 ## Project Milestones
 
 ### Milestone 1 (Due: 22/11/25) - 12 marks
 - **Preprocessing of the captured image** (4 marks) ✅
-- **Outer frame isolation** (4 marks) - In Progress
-- **Outer frame corners identification** (2 marks) - Pending
+- **Outer frame isolation** (4 marks) ✅
+- **Outer frame corners identification** (2 marks) ✅
 - **Grid straightening into a square** (2 marks) - Pending
 
-## Current Implementation 
+## Current Implementation (Branch 2)
 
 ### ✅ Image Preprocessing Module (4 marks)
+
+**Status**: Complete
 
 This module implements robust image preprocessing for Sudoku grid detection, handling various image quality issues: noise, uneven lighting, poor contrast.
 
@@ -94,6 +95,85 @@ Binary Preprocessed Image
 - Tomasi & Manduchi (1998): "Bilateral filtering for gray and color images"
 - Bradski & Kaehler, "Learning OpenCV" (2008)
 
+---
+
+### ✅ Grid Detection Module (6 marks: 4 + 2)
+
+**Status**: Complete
+
+This module implements dual-method grid detection combining contour-based and line-based approaches for robust Sudoku grid isolation and corner identification.
+
+#### Detection Methods:
+
+**Method 1: Contour-Based Detection** (Optimal for clear grids)
+- Uses Suzuki-Abe (1985) algorithm for contour extraction
+- Douglas-Peucker polygon approximation for simplification
+- Convex hull computation for corner identification
+- Multi-pass approximation with varying epsilon values (0.01-0.05)
+- Best for: Clear grid borders, good contrast images
+
+**Method 2: Line-Based Hough Transform** (Robust for faint/occluded grids)
+- Probabilistic Hough Transform for line detection
+- Line clustering with IQR outlier removal
+- Intersection-based corner computation
+- Equation-based refinement for precision
+- Best for: Faint grids, broken lines, occluded corners
+
+#### Adaptive Selection Logic:
+
+The system runs both methods in parallel and selects the best result using:
+
+**1. Composite Scoring**:
+- Quality score (0-1): Transform quality based on corner geometry
+- Aspect ratio score: How close to square (1.0 = perfect)
+- Coverage score: What % of image does grid occupy
+
+**2. Selection Strategy**:
+- **Contour Bias**: Requires line-based to score >0.075 higher to be selected
+- **Blockage Detection**: Checks corner displacement between methods (>6% diagonal)
+- **Coverage Override**: If corners blocked AND coverage gap <20%, use line-based
+
+**3. Validation**:
+- Aspect ratio validation (tolerance: ±20%)
+- Corner geometry validation (angles 60-120°, convexity check)
+- Quality scoring for transformation assessment
+
+#### Corner Identification (2 marks):
+
+**Precision Extraction**:
+- Four-corner detection from contour or line intersections
+- Ordering: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]
+- Geometry validation to ensure valid quadrilateral
+- Quality scoring based on aspect ratios
+
+**Algorithms**:
+- Convex hull for contour-based corners
+- Sklansky's algorithm for hull computation
+- Line intersection computation for Hough-based corners
+- Centroid-based angle sorting for proper ordering
+
+#### Visualization Features:
+
+- 9×9 grid overlay showing cell structure
+- Corner markers with labels
+- Detection method visualization
+- Quality score display
+
+#### Technical Algorithms:
+
+1. **Suzuki-Abe (1985)**: Topological structural analysis
+2. **Douglas-Peucker (1973)**: Polygon approximation
+3. **Hough (1962)**: Line detection through parameter space voting
+4. **Sklansky (1982)**: Convex hull computation
+
+#### References:
+- Suzuki & Abe (1985): "Topological Structural Analysis of Digitized Binary Images"
+- Hough (1962): "Method and means for recognizing complex patterns"
+- Douglas & Peucker (1973): "Algorithms for the reduction of points"
+- Sklansky (1982): "Finding the convex hull of a simple polygon"
+
+## Installation
+
 ### Requirements
 - Python 3.7 or higher
 - OpenCV 4.8.0+
@@ -109,14 +189,15 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Current Functionality (Branch 1)
+### Current Functionality
 
 ```bash
 # Test preprocessing on an image
 python -c "from src.preprocessing import preprocess_image; preprocess_image('01.jpg', display=True)"
-```
 
-This will display the preprocessing stages and save intermediate results.
+# Test grid detection
+python -c "from src.grid_detection import find_largest_contour, find_grid_corners; import cv2; img = cv2.imread('01.jpg'); print('Testing grid detection...')"
+```
 
 ## Project Structure
 
@@ -125,7 +206,8 @@ SudokuSolver/
 ├── src/
 │   ├── __init__.py              # Package initialization
 │   ├── __main__.py              # Entry point for module execution
-│   └── preprocessing.py         # Image preprocessing (Milestone 1: 4 marks) ✅
+│   ├── preprocessing.py         # Image preprocessing (4 marks) ✅
+│   └── grid_detection.py        # Grid detection + corners (6 marks) ✅
 ├── process_image.py             # Convenience script
 ├── requirements.txt             # Python dependencies
 ├── .gitignore                   # Git ignore rules
@@ -134,18 +216,12 @@ SudokuSolver/
 
 ## Next Steps
 
-Grid detection and corner identification (6 marks)
-- Implement contour-based detection
-- Implement line-based Hough Transform detection
-- Adaptive method selection
-- Corner extraction and validation
-
 Perspective transformation (2 marks)
 - Homography computation
 - Grid straightening to 450×450
 
-Pipeline integration
-- Comprehensive output
+Complete pipeline integration
 
-**Current Status**: Preprocessing Complete (4/12 marks)
+## Development Notes
+
 **Next Milestone**: Milestone 2 - December 4, 2025

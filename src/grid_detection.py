@@ -1282,7 +1282,7 @@ def detect_blocked_corners(corners_contour, corners_lines, processed_image, debu
         print(f"        Max corner displacement: {max_displacement:.1f} pixels ({displacement_ratio*100:.1f}% of diagonal)")
 
     
-            print(f"        ✓ Occlusion detected: corners displaced by {displacement_ratio*100:.1f}% of diagonal")
+        print(f"        ✓ Occlusion detected: corners displaced by {displacement_ratio*100:.1f}% of diagonal")
         return True, f"Corner blocked: corners displaced by {displacement_ratio*100:.1f}% of image diagonal"
 
     if debug:

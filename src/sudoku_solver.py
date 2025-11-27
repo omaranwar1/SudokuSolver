@@ -15,6 +15,7 @@ from .grid_detection import (
     draw_contour_and_corners,
     validate_grid_is_square,
     draw_9x9_grid_lines,
+    detect_grid_hybrid,
     detect_grid_using_lines,
     draw_template_grid,
     reinforce_grid_morphological,
@@ -99,31 +100,33 @@ class SudokuSolver:
         contour_result = None
         line_result = None
 
-        print("\n      [Method 1] Contour detection...")
-        contour = find_largest_contour(processed)
+        print("\n      [Method 1] Hybrid detection (minAreaRect + Hough fallback)...")
+        corners_hybrid, contour = detect_grid_hybrid(processed, debug=False)
 
-        if contour is not None:
-            area = cv2.contourArea(contour)
-            print(f"        ✓ Contour found (area: {area:.0f} pixels)")
+        if corners_hybrid is not None:
+            if contour is not None:
+                area = cv2.contourArea(contour)
+                image_area = processed.shape[0] * processed.shape[1]
+                coverage_contour = area / image_area
+            else:
+                area = 0
+                coverage_contour = 0
 
-            corners_contour = find_grid_corners(contour)
-            quality_contour = get_transform_quality_score(corners_contour)
-            is_square_c, aspect_ratio_c, _ = validate_grid_is_square(corners_contour)
+            quality_contour = get_transform_quality_score(corners_hybrid)
+            is_square_c, aspect_ratio_c, _ = validate_grid_is_square(corners_hybrid)
 
-            image_area = processed.shape[0] * processed.shape[1]
-            coverage_contour = area / image_area
-
+            print(f"        ✓ Hybrid corners found (area: {area:.0f} pixels)")
             print(f"        Quality: {quality_contour:.3f}, Ratio: {aspect_ratio_c:.3f}, Coverage: {coverage_contour:.3f}")
 
             contour_result = {
-                'corners': corners_contour,
+                'corners': corners_hybrid,
                 'quality': quality_contour,
                 'aspect_ratio': aspect_ratio_c,
                 'coverage': coverage_contour,
                 'contour': contour
             }
         else:
-            print(f"        ✗ No contour found")
+            print(f"        ✗ Hybrid detection failed")
 
         print("\n      [Method 2] Line-based detection (Hough Transform)...")
         corners_lines = detect_grid_using_lines(processed, debug=False)

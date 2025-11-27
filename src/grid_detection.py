@@ -599,22 +599,31 @@ def validate_corner_geometry(corners, min_angle=60, max_angle=120):
 def find_largest_contour(processed_image):
     """
     Find the largest contour in the image, which should be the Sudoku grid.
-
-    The algorithm:
-    1. Finds all contours in the binary image
-    2. Filters contours by area (must be significant portion of image)
-    3. Returns the largest contour by area
-
-    Args:
-        processed_image: Binary preprocessed image (numpy array)
-
-    Returns:
-        numpy.ndarray: Largest contour or None if not found
-
-    References:
-        - Suzuki & Abe (1985): Topological structural analysis method
-        - OpenCV findContours: https://docs.opencv.org/4.x/d3/dc0/group__imgproc__shape.html
     """
+    # Light cleanup to connect outer frame before contouring
+    kernel = np.ones((3, 3), np.uint8)
+    work = cv2.morphologyEx(processed_image, cv2.MORPH_CLOSE, kernel, iterations=1)
+    work = cv2.morphologyEx(work, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(
+        work,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if not contours:
+        return None
+
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    image_area = processed_image.shape[0] * processed_image.shape[1]
+    min_area = image_area * 0.05
+
+    for contour in contours:
+        if cv2.contourArea(contour) > min_area:
+            return contour
+
+    return None
    
     contours, hierarchy = cv2.findContours(
         processed_image,
@@ -1134,6 +1143,40 @@ def detect_grid_using_lines(processed_image, debug=False):
     return corners
 
 
+def detect_grid_hybrid(processed_image, debug=False):
+    """
+    Hybrid detector: try a stable minAreaRect box on the largest component,
+    fall back to Hough-based line intersections if needed.
+
+    Returns:
+        corners (np.ndarray or None), contour_for_draw (np.ndarray or None)
+    """
+    h, w = processed_image.shape
+    image_area = h * w
+
+    contour = find_largest_contour(processed_image)
+    if contour is not None and contour.size >= 6:
+        hull = cv2.convexHull(contour)
+        rect = cv2.minAreaRect(hull)
+        box = cv2.boxPoints(rect).astype(np.float32)
+        box_area = cv2.contourArea(box)
+        w_vec = np.linalg.norm(box[1] - box[0])
+        h_vec = np.linalg.norm(box[2] - box[1])
+        aspect = max(w_vec, h_vec) / max(min(w_vec, h_vec), 1e-6)
+        center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
+        centroid = np.mean(box, axis=0)
+        center_dist = np.linalg.norm(centroid - center) / (np.sqrt(image_area) + 1e-6)
+
+        if box_area > 0.05 * image_area and aspect < 1.8 and center_dist < 0.25:
+            corners = order_corners(box)
+            return corners, hull
+        if debug:
+            print("      MinAreaRect rejected (area/aspect/center), falling back to Hough lines")
+
+    corners = detect_grid_using_lines(processed_image, debug=debug)
+    return corners, None
+
+
 def cluster_lines(line_positions, tolerance=10):
     """
     Cluster line positions that are close together.
@@ -1307,16 +1350,16 @@ def draw_contour_and_corners(image, contour, corners):
     """
     output = image.copy()
 
-    # Draw the contour in green
-    cv2.drawContours(output, [contour], -1, (0, 255, 0), 3)
+    if contour is not None and hasattr(contour, "size") and contour.size >= 6:
+        contour_int = contour.astype(int).reshape(-1, 1, 2)
+        cv2.drawContours(output, [contour_int], -1, (0, 255, 0), 3)
 
-    # Draw corners as red circles
-    for i, corner in enumerate(corners):
-        x, y = int(corner[0]), int(corner[1])
-        cv2.circle(output, (x, y), 10, (0, 0, 255), -1)
-        
-        cv2.putText(output, str(i), (x + 15, y + 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    if corners is not None:
+        for i, corner in enumerate(corners):
+            x, y = int(corner[0]), int(corner[1])
+            cv2.circle(output, (x, y), 10, (0, 0, 255), -1)
+            cv2.putText(output, str(i), (x + 15, y + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
     return output
     

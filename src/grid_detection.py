@@ -618,39 +618,34 @@ def find_largest_contour(processed_image):
 
     image_area = processed_image.shape[0] * processed_image.shape[1]
     min_area = image_area * 0.05
+    h, w = processed_image.shape[:2]
 
-    for contour in contours:
-        if cv2.contourArea(contour) > min_area:
-            return contour
-
-    return None
-   
-    contours, hierarchy = cv2.findContours(
-        processed_image,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    if not contours:
-        return None
-
-   
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-
-    
-    image_area = processed_image.shape[0] * processed_image.shape[1]
-    min_area = image_area * 0.2
+    # Avoid mistaking the image border for the Sudoku grid by skipping contours
+    # that hug the frame; still keep the best edge-hugging candidate as a fallback
+    edge_margin = int(min(h, w) * 0.02)
+    edge_margin = max(edge_margin, 5)
+    edge_candidate = None
 
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area > min_area:
-            
-            perimeter = cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+        if area <= min_area:
+            continue
 
-            
-            if len(approx) >= 4:
-                return contour
+        x, y, cw, ch = cv2.boundingRect(contour)
+        touches_edge = (
+            x <= edge_margin or y <= edge_margin or
+            x + cw >= w - edge_margin or y + ch >= h - edge_margin
+        )
+
+        if touches_edge:
+            if edge_candidate is None:
+                edge_candidate = contour
+            continue
+
+        return contour
+
+    if edge_candidate is not None:
+        return edge_candidate
 
     return None
 

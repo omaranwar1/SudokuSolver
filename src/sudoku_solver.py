@@ -24,6 +24,8 @@ from .grid_detection import (
     detect_blocked_corners
 )
 from .perspective_transform import perspective_transform, get_transform_quality_score
+from .ocr import extract_grid_digits, format_board, render_solution_on_image, resolve_conflicts
+from .solver import solve_puzzle
 
 
 class SudokuSolver:
@@ -284,6 +286,34 @@ class SudokuSolver:
             print(f"      ✓ Grid reinforcement applied")
         else:
             print(f"      ✓ Grid is complete, no reinforcement needed")
+
+        print("\n[6/6] OCR (pattern matching) and solving...")
+        board_raw, scores = extract_grid_digits(final_binary)
+        board, conflict_notes = resolve_conflicts(board_raw, scores)
+        print("\n      Detected puzzle:")
+        print(format_board(board))
+        if conflict_notes:
+            print("      Note: cleaned duplicate detections:")
+            for note in conflict_notes:
+                print(f"        - {note}")
+
+        given_count = np.count_nonzero(board)
+        if given_count < 15:
+            print(f"      WARNING: Low number of detected givens ({given_count}); OCR may be unreliable")
+
+        solution, solve_msg = solve_puzzle(board)
+        if solution is None:
+            print(f"      ✗ Could not solve: {solve_msg}")
+            print("        (Check OCR accuracy or image quality)")
+        else:
+            print(f"      ✓ Solved puzzle ({solve_msg}):")
+            print(format_board(solution))
+            solved_overlay = render_solution_on_image(
+                self.intermediate_images['straightened'],
+                solution,
+                board
+            )
+            self.intermediate_images['solved_overlay'] = solved_overlay
 
         if self.save_intermediate:
             self._save_results(image_path, output_dir)

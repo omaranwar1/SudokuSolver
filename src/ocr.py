@@ -10,31 +10,79 @@ Approach:
 
 import cv2
 import numpy as np
+from typing import Dict, List, Tuple, Optional
 
 
-def build_digit_templates(size: int = 28, thicknesses: tuple[int, ...] = (1, 2, 3)) -> dict[int, list[np.ndarray]]:
-    """Generate clean digit templates (1-9) rendered with multiple stroke widths."""
-    templates: dict[int, list[np.ndarray]] = {}
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
+def build_digit_templates(size: int = 28, 
+                          thicknesses: Tuple[int, ...] = (1, 2, 3),
+                          fonts: Optional[Tuple[int, ...]] = None,
+                          scales: Tuple[float, ...] = (0.9, 1.0, 1.1, 1.2),
+                          rotations: Tuple[float, ...] = (0,)) -> Dict[int, List[np.ndarray]]:
+    """
+    Generate diverse digit templates (1-9) with multiple variations.
+    
+    Args:
+        size: Template image size (size x size)
+        thicknesses: Line thickness values to try
+        fonts: OpenCV font styles (None = use multiple defaults)
+        scales: Font scale factors
+        rotations: Rotation angles in degrees (default: no rotation)
+        
+    Returns:
+        Dictionary mapping digit -> list of template variants
+    """
+    if fonts is None:
+        # Reduced to 2 most reliable fonts to minimize false positives
+        fonts = (
+            cv2.FONT_HERSHEY_SIMPLEX,
+            cv2.FONT_HERSHEY_DUPLEX
+        )
+    
+    templates: Dict[int, List[np.ndarray]] = {}
+    
     for digit in range(1, 10):
         variants = []
-        for thickness in thicknesses:
-            canvas = np.zeros((size, size), dtype=np.uint8)
-            cv2.putText(
-                canvas,
-                str(digit),
-                (size // 6, int(size * 0.8)),
-                font,
-                1.2,
-                255,
-                thickness,
-                cv2.LINE_AA,
-            )
-            variants.append(canvas)
+        
+        for font in fonts:
+            for thickness in thicknesses:
+                for scale in scales:
+                    for rotation in rotations:
+                        # Create base canvas
+                        canvas = np.zeros((size, size), dtype=np.uint8)
+                        
+                        # Render digit centered
+                        text = str(digit)
+                        text_size, _ = cv2.getTextSize(text, font, scale, thickness)
+                        x = (size - text_size[0]) // 2
+                        y = (size + text_size[1]) // 2
+                        
+                        cv2.putText(
+                            canvas,
+                            text,
+                            (x, y),
+                            font,
+                            scale,
+                            255,
+                            thickness,
+                            cv2.LINE_AA
+                        )
+                        
+                        # Apply slight rotation if needed
+                        if abs(rotation) > 0.1:
+                            center = (size // 2, size // 2)
+                            M = cv2.getRotationMatrix2D(center, rotation, 1.0)
+                            canvas = cv2.warpAffine(canvas, M, (size, size))
+                        
+                        # Normalize template
+                        if canvas.max() > 0:
+                            canvas = cv2.normalize(canvas, None, 0, 255, cv2.NORM_MINMAX)
+                            variants.append(canvas)
+        
         templates[digit] = variants
-
+    
     return templates
+
+
 
 
 def remove_grid_lines(binary_grid: np.ndarray) -> np.ndarray:
@@ -66,14 +114,501 @@ def remove_grid_lines(binary_grid: np.ndarray) -> np.ndarray:
     return digits_only
 
 
-def _extract_digit_from_cell(cell: np.ndarray, templates: dict[int, list[np.ndarray]],
-                             min_fill: float = 0.004,
-                             accept_threshold: float = 0.30) -> tuple[int, float]:
+def count_holes(binary_image: np.ndarray) -> int:
     """
-    Recognize a digit from a single cell image.
+    Count the number of holes in a binary image using Euler number.
+    
+    Holes are enclosed regions (like the hole in 0, 6, 8, 9).
+    """
+    # Find contours with hierarchy to detect holes
+    contours, hierarchy = cv2.findContours(binary_image, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if hierarchy is None or len(contours) == 0:
+        return 0
+    
+    # Count contours that have a parent (i.e., they're holes)
+    holes = 0
+    for i, h in enumerate(hierarchy[0]):
+        # h[3] is the parent index; if >= 0, this contour is inside another
+        if h[3] >= 0:
+            holes += 1
+    
+    return holes
+
+
+def compute_symmetry_score(binary_image: np.ndarray, axis: str = 'vertical') -> float:
+    """
+    Compute symmetry score along vertical or horizontal axis.
+    
+    Returns value between 0 (not symmetric) and 1 (perfectly symmetric).
+    """
+    if binary_image.size == 0:
+        return 0.0
+    
+    if axis == 'vertical':
+        # Flip horizontally
+        flipped = cv2.flip(binary_image, 1)
+    else:  # horizontal
+        # Flip vertically
+        flipped = cv2.flip(binary_image, 0)
+    
+    # Compute overlap
+    intersection = cv2.bitwise_and(binary_image, flipped)
+    union = cv2.bitwise_or(binary_image, flipped)
+    
+    union_pixels = cv2.countNonZero(union)
+    if union_pixels == 0:
+        return 0.0
+    
+    intersection_pixels = cv2.countNonZero(intersection)
+    return intersection_pixels / union_pixels
+
+
+def analyze_digit_topology(binary_image: np.ndarray) -> Dict[str, float]:
+    """
+    Extract topological and geometric features from a digit image.
+    
+    Returns dictionary of features useful for digit classification.
+    """
+    features = {}
+    
+    # 1. Hole count (Euler number method)
+    features['holes'] = count_holes(binary_image)
+    
+    # 2. Aspect ratio
+    h, w = binary_image.shape
+    if w > 0:
+        features['aspect_ratio'] = h / w
+    else:
+        features['aspect_ratio'] = 0.0
+    
+    # 3. Vertical and horizontal symmetry
+    features['v_symmetry'] = compute_symmetry_score(binary_image, 'vertical')
+    features['h_symmetry'] = compute_symmetry_score(binary_image, 'horizontal')
+    
+    # 4. Fill ratio (how much of bounding box is filled)
+    total_pixels = binary_image.size
+    white_pixels = cv2.countNonZero(binary_image)
+    features['fill_ratio'] = white_pixels / total_pixels if total_pixels > 0 else 0.0
+    
+    # 5. Top-heavy vs bottom-heavy
+    mid = h // 2
+    top_half = binary_image[:mid, :]
+    bottom_half = binary_image[mid:, :]
+    
+    top_pixels = cv2.countNonZero(top_half)
+    bottom_pixels = cv2.countNonZero(bottom_half)
+    total = top_pixels + bottom_pixels
+    
+    if total > 0:
+        features['top_heavy'] = top_pixels / total
+        features['bottom_heavy'] = bottom_pixels / total
+    else:
+        features['top_heavy'] = 0.5
+        features['bottom_heavy'] = 0.5
+    
+    return features
+
+
+def validate_digit_topology(predicted_digit: int, features: Dict[str, float]) -> bool:
+    """
+    Validate if topological features match expected patterns for the predicted digit.
+    
+    Returns True if features are consistent, False if contradictory.
+    """
+    # Define expected characteristics for each digit
+    rules = {
+        1: {
+            'holes': (0, 0),  # (min, max)
+            'aspect_ratio': (1.8, 5.0),  # Tall and narrow
+            'fill_ratio': (0.05, 0.25),  # Sparse
+        },
+        2: {
+            'holes': (0, 0),
+            'aspect_ratio': (0.8, 2.0),
+            'fill_ratio': (0.15, 0.40),
+        },
+        3: {
+            'holes': (0, 0),
+            'aspect_ratio': (0.9, 2.0),
+            'fill_ratio': (0.12, 0.35),
+        },
+        4: {
+            'holes': (0, 1),  # Sometimes has a small hole
+            'aspect_ratio': (0.9, 2.2),
+            'fill_ratio': (0.10, 0.35),
+        },
+        5: {
+            'holes': (0, 0),
+            'aspect_ratio': (0.9, 2.0),
+            'fill_ratio': (0.15, 0.38),
+        },
+        6: {
+            'holes': (1, 1),  # Always has one hole
+            'aspect_ratio': (1.0, 2.0),
+            'bottom_heavy': (0.55, 1.0),  # Hole is at bottom
+        },
+        7: {
+            'holes': (0, 0),
+            'aspect_ratio': (0.9, 2.2),
+            'top_heavy': (0.30, 0.60),  # Top bar
+        },
+        8: {
+            'holes': (1, 2),  # Usually 2 holes, sometimes merged to 1
+            'aspect_ratio': (0.8, 1.5),  # More square
+            'v_symmetry': (0.6, 1.0),  # Vertically symmetric
+        },
+        9: {
+            'holes': (1, 1),  # One hole
+            'aspect_ratio': (1.0, 2.0),
+            'top_heavy': (0.52, 1.0),  # Hole is at top
+        },
+        0: {
+            'holes': (1, 1),  # One hole
+            'aspect_ratio': (0.9, 1.6),
+            'v_symmetry': (0.65, 1.0),  # Usually symmetric
+        },
+    }
+    
+    if predicted_digit not in rules:
+        return True  # No rules defined, accept
+    
+    rule = rules[predicted_digit]
+    violations = 0
+    
+    for feature_name, (min_val, max_val) in rule.items():
+        if feature_name not in features:
+            continue
+        
+        feature_val = features[feature_name]
+        
+        # Check if feature is outside expected range
+        if feature_val < min_val or feature_val > max_val:
+            violations += 1
+    
+    # Allow 1 violation, but not more (some tolerance for variation)
+    return violations <= 1
+
+
+def is_likely_empty_cell(binary_image: np.ndarray) -> bool:
+    """
+    Multi-factor empty cell detection to reduce false positives.
+    
+    Returns True if the cell is likely empty (noise/shadows, not a digit).
+    """
+    if binary_image.size == 0:
+        return True
+    
+    # Factor 1: Variance check - empty cells have low variance
+    variance = np.var(binary_image)
+    if variance < 60:  # Increased from 30 - very uniform = likely empty
+        return True
+    
+    # Factor 2: Edge density - real digits have clear edges
+    edges = cv2.Canny(binary_image, 50, 150)
+    edge_ratio = cv2.countNonZero(edges) / edges.size if edges.size > 0 else 0
+    if edge_ratio < 0.012:  # Increased from 0.008 - very few edges = likely empty
+        return True
+    
+    # Factor 3: Component fragmentation - too many small fragments = noise
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_image, connectivity=8)
+    if num_labels > 6:  # Too fragmented = noise, not digit
+        return True
+    
+    # Factor 4: Perimeter-to-area ratio for largest component
+    if num_labels > 1:
+        # Find largest component (skip background)
+        areas = [stats[i, cv2.CC_STAT_AREA] for i in range(1, num_labels)]
+        if areas:
+            largest_idx = areas.index(max(areas)) + 1
+            
+            # Create mask for largest component
+            component_mask = (labels == largest_idx).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                perimeter = cv2.arcLength(contours[0], True)
+                area = cv2.contourArea(contours[0])
+                if area > 10:  # Avoid division by very small areas
+                    compactness = perimeter * perimeter / (4 * np.pi * area)
+                    if compactness > 8:  # Too irregular = noise
+                        return True
+    
+    return False
+
+
+def analyze_contour_features(binary_image: np.ndarray) -> Optional[Dict[str, float]]:
+    """
+    Extract detailed contour-based shape descriptors.
+    
+    Returns dictionary of features or None if no contour found.
+    """
+    contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    
+    # Use largest contour
+    contour = max(contours, key=cv2.contourArea)
+    
+    if len(contour) < 5:  # Need at least 5 points for meaningful analysis
+        return None
+    
+    features = {}
+    
+    # 1. Hu Moments (rotation/scale invariant shape descriptors)
+    moments = cv2.moments(contour)
+    if moments['m00'] != 0:  # Avoid division by zero
+        hu_moments = cv2.HuMoments(moments).flatten()
+        # Store first 3 Hu moments (most discriminative)
+        for i in range(min(3, len(hu_moments))):
+            features[f'hu_{i}'] = -np.sign(hu_moments[i]) * np.log10(abs(hu_moments[i]) + 1e-10)
+    
+    # 2. Solidity (compactness measure)
+    hull = cv2.convexHull(contour)
+    hull_area = cv2.contourArea(hull)
+    contour_area = cv2.contourArea(contour)
+    if hull_area > 0:
+        features['solidity'] = contour_area / hull_area
+    else:
+        features['solidity'] = 0.0
+    
+    # 3. Convexity defects (concavities)
+    hull_indices = cv2.convexHull(contour, returnPoints=False)
+    if len(hull_indices) > 3 and len(contour) > 3:
+        try:
+            defects = cv2.convexityDefects(contour, hull_indices)
+            if defects is not None:
+                features['num_defects'] = len(defects)
+                # Depth of deepest defect
+                features['max_defect_depth'] = max(defects[:, 0, 3]) / 256.0 if len(defects) > 0 else 0
+            else:
+                features['num_defects'] = 0
+                features['max_defect_depth'] = 0.0
+        except:
+            features['num_defects'] = 0
+            features['max_defect_depth'] = 0.0
+    else:
+        features['num_defects'] = 0
+        features['max_defect_depth'] = 0.0
+    
+    # 4. Extent (ratio of contour area to bounding rectangle area)
+    x, y, w, h = cv2.boundingRect(contour)
+    rect_area = w * h
+    if rect_area > 0:
+        features['extent'] = contour_area / rect_area
+    else:
+        features['extent'] = 0.0
+    
+    return features
+
+
+def analyze_skeleton(binary_image: np.ndarray) -> Dict[str, int]:
+    """
+    Extract skeleton-based features (endpoints, junctions).
+    
+    Useful for distinguishing digits:
+    - 1: 2 endpoints, 0 junctions
+    - 7: 3 endpoints, 0 junctions  
+    - 4: 4 endpoints, 1 junction
+    - 8: 0 endpoints, 2+ junctions
+    """
+    features = {'num_endpoints': 0, 'num_junctions': 0}
+    
+    if binary_image.size == 0 or cv2.countNonZero(binary_image) == 0:
+        return features
+    
+    # Skeletonize using Zhang-Suen thinning
+    try:
+        skeleton = cv2.ximgproc.thinning(binary_image, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
+    except:
+        # Fallback if ximgproc not available
+        return features
+    
+    endpoints = []
+    junctions = []
+    
+    # Analyze skeleton pixels
+    for y in range(1, skeleton.shape[0] - 1):
+        for x in range(1, skeleton.shape[1] - 1):
+            if skeleton[y, x] == 0:
+                continue
+            
+            # Count 8-connected neighbors
+            neighbors = [
+                skeleton[y-1, x-1], skeleton[y-1, x], skeleton[y-1, x+1],
+                skeleton[y, x-1],                       skeleton[y, x+1],
+                skeleton[y+1, x-1], skeleton[y+1, x], skeleton[y+1, x+1]
+            ]
+            neighbor_count = sum(1 for n in neighbors if n > 0)
+            
+            if neighbor_count == 1:
+                endpoints.append((x, y))
+            elif neighbor_count >= 3:
+                junctions.append((x, y))
+    
+    features['num_endpoints'] = len(endpoints)
+    features['num_junctions'] = len(junctions)
+    
+    return features
+
+
+def validate_digit_with_advanced_features(predicted_digit: int, 
+                                          contour_features: Optional[Dict[str, float]],
+                                          skeleton_features: Dict[str, int]) -> bool:
+    """
+    Validate digit prediction using contour and skeleton features.
+    
+    Returns True if features are consistent with predicted digit.
+    """
+    if predicted_digit == 0:
+        return True
+    
+    # Skeleton-based rules
+    skeleton_rules = {
+        1: {'endpoints': (2, 2), 'junctions': (0, 0)},
+        7: {'endpoints': (2, 4), 'junctions': (0, 1)},
+        4: {'endpoints': (3, 5), 'junctions': (1, 3)},
+        8: {'endpoints': (0, 1), 'junctions': (1, 4)},
+        0: {'endpoints': (0, 1), 'junctions': (0, 2)},
+    }
+    
+    violations = 0
+    
+    # Check skeleton features
+    if predicted_digit in skeleton_rules:
+        rule = skeleton_rules[predicted_digit]
+        for feature_name, (min_val, max_val) in rule.items():
+            if feature_name == 'endpoints':
+                val = skeleton_features.get('num_endpoints', 0)
+            elif feature_name == 'junctions':
+                val = skeleton_features.get('num_junctions', 0)
+            else:
+                continue
+            
+            if val < min_val or val > max_val:
+                violations += 1
+    
+    # Check contour features
+    if contour_features:
+        contour_rules = {
+            1: {'solidity': (0.7, 1.0), 'num_defects': (0, 2)},
+            8: {'solidity': (0.4, 0.75), 'num_defects': (2, 10)},
+            6: {'solidity': (0.55, 0.85), 'num_defects': (1, 6)},
+            9: {'solidity': (0.55, 0.85), 'num_defects': (1, 6)},
+            0: {'solidity': (0.6, 0.9), 'num_defects': (0, 4)},
+        }
+        
+        if predicted_digit in contour_rules:
+            rule = contour_rules[predicted_digit]
+            for feature_name, (min_val, max_val) in rule.items():
+                val = contour_features.get(feature_name, 0)
+                if val < min_val or val > max_val:
+                    violations += 1
+    
+    # Allow up to 1 violation for tolerance
+    return violations <= 1
+
+
+
+def _extract_digit_with_sliding_window(cell: np.ndarray, templates: Dict[int, List[np.ndarray]],
+                                       step_sizes: List[float] = [0.2, 0.5, 1.0]) -> Tuple[int, float, List[Tuple[int, float]]]:
+    """
+    Extract digit using sliding window with multiple scales and positions.
+    
+    This tests multiple window sizes and positions to find the best match,
+    helping with digits that aren't perfectly centered or sized.
+    
+    Args:
+        cell: Input cell image
+        templates: Digit templates
+        step_sizes: List of step sizes as fraction of window size (0.2 = 20% steps)
+    
+    Returns:
+        (best_digit, best_score, candidates)
+    """
+    h, w = cell.shape
+    
+    # Test different scales of the window (relative to cell size)
+    # 0.7 = smaller window (tighter crop around digit)
+    # 1.0 = full cell
+    # 1.3 = slightly larger (in case digit extends to edges)
+    scales = [0.7, 0.85, 1.0, 1.15]
+    
+    best_digit = 0
+    best_score = 0.0
+    all_results = {}  # digit -> list of scores
+    
+    for scale in scales:
+        # Window size at this scale
+        win_h = int(h * scale)
+        win_w = int(w * scale)
+        
+        # Ensure window fits in cell
+        win_h = min(win_h, h)
+        win_w = min(win_w, w)
+        
+        # Try multiple step sizes for this scale
+        for step_frac in step_sizes:
+            step_y = max(1, int(win_h * step_frac))
+            step_x = max(1, int(win_w * step_frac))
+            
+            # Slide window across cell
+            for y in range(0, h - win_h + 1, step_y):
+                for x in range(0, w - win_w + 1, step_x):
+                    # Extract window
+                    window = cell[y:y+win_h, x:x+win_w]
+                    
+                    # Use existing extraction logic on this window
+                    digit, score, _ = _extract_digit_from_cell_core(window, templates)
+                    
+                    if digit > 0:
+                        if digit not in all_results:
+                            all_results[digit] = []
+                        all_results[digit].append(score)
+                        
+                        if score > best_score:
+                            best_score = score
+                            best_digit = digit
+    
+    # Build candidate list from aggregated results
+    candidates = []
+    for digit in sorted(all_results.keys(), key=lambda d: max(all_results[d]), reverse=True)[:3]:
+        max_score = max(all_results[digit])
+        candidates.append((digit, max_score))
+    
+    return best_digit, best_score, candidates
+
+
+def _extract_digit_from_cell(cell: np.ndarray, templates: Dict[int, List[np.ndarray]],
+                             min_fill: float = 0.004,
+                             accept_threshold: float = 0.48,
+                             use_sliding_window: bool = True) -> Tuple[int, float, List[Tuple[int, float]]]:
+    """
+    Recognize a digit from a single cell image using enhanced preprocessing.
+    
+    Args:
+        use_sliding_window: If True, use sliding window multi-scale detection
 
     Returns:
-        (digit, score) where digit=0 means empty cell.
+        (digit, score, candidates) where digit=0 means empty cell.
+    """
+    if use_sliding_window:
+        # Try sliding window approach first
+        return _extract_digit_with_sliding_window(cell, templates)
+    else:
+        # Use original single-extraction approach
+        return _extract_digit_from_cell_core(cell, templates, min_fill, accept_threshold)
+
+
+def _extract_digit_from_cell_core(cell: np.ndarray, templates: Dict[int, List[np.ndarray]],
+                                  min_fill: float = 0.004,
+                                  accept_threshold: float = 0.48) -> Tuple[int, float, List[Tuple[int, float]]]:
+    """
+    Core digit extraction logic (original implementation).
+    Now called by wrapper functions that can use sliding window or direct extraction.
+
+    Returns:
+        (digit, score, candidates) where digit=0 means empty cell.
     """
     h, w = cell.shape
     margin = max(1, int(min(h, w) * 0.05))
@@ -84,65 +619,243 @@ def _extract_digit_from_cell(cell: np.ndarray, templates: dict[int, list[np.ndar
     if work.mean() > 127:
         work = cv2.bitwise_not(work)
 
-    work = cv2.GaussianBlur(work, (3, 3), 0)
-    _, binary = cv2.threshold(work, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    # This improves contrast for digits in varying lighting conditions
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    work = clahe.apply(work)
+    
+    # Bilateral filter: reduces noise while preserving edges
+    work = cv2.bilateralFilter(work, 5, 50, 50)
+    
+    # Try multiple adaptive thresholding strategies and pick the best
+    binary_candidates = []
+    
+    # Method 1: Otsu thresholding
+    work_blur = cv2.GaussianBlur(work, (3, 3), 0)
+    _, binary1 = cv2.threshold(work_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    binary_candidates.append(binary1)
+    
+    # Method 2: Adaptive threshold with smaller block size
+    binary2 = cv2.adaptiveThreshold(work, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 11, 2)
+    binary_candidates.append(binary2)
+    
+    # Method 3: Adaptive threshold with larger block size
+    block_size = min(work.shape[0], work.shape[1]) // 3
+    if block_size % 2 == 0:
+        block_size += 1
+    block_size = max(11, min(31, block_size))
+    binary3 = cv2.adaptiveThreshold(work, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, block_size, 2)
+    binary_candidates.append(binary3)
+    
+    # Select best binarization based on quality heuristics
+    best_binary = None
+    best_quality = -1
+    
+    for binary in binary_candidates:
+        # Suppress residual grid bleed by clearing borders
+        test_binary = binary.copy()
+        border = max(2, int(min(h, w) * 0.08))
+        test_binary[:border, :] = 0
+        test_binary[-border:, :] = 0
+        test_binary[:, :border] = 0
+        test_binary[:, -border:] = 0
+        
+        # Quality = non-zero pixels in reasonable range
+        non_zero = cv2.countNonZero(test_binary)
+        total = test_binary.size
+        fill_ratio = non_zero / total
+        
+        # Good digits have 8-35% fill (more restrictive to reduce noise)
+        if 0.08 <= fill_ratio <= 0.35:
+            quality = 1.0 - abs(0.18 - fill_ratio)  # Prefer ~18% fill
+            if quality > best_quality:
+                best_quality = quality
+                best_binary = test_binary
+    
+    if best_binary is None:
+        # Fallback to first candidate
+        binary = binary_candidates[0].copy()
+        border = max(2, int(min(h, w) * 0.08))
+        binary[:border, :] = 0
+        binary[-border:, :] = 0
+        binary[:, :border] = 0
+        binary[:, -border:] = 0
+        best_binary = binary
 
-    # Suppress residual grid bleed by clearing a small border
-    border = max(2, int(min(h, w) * 0.08))
-    binary[:border, :] = 0
-    binary[-border:, :] = 0
-    binary[:, :border] = 0
-    binary[:, -border:] = 0
+    binary = best_binary
+    
+    # NOTE: Empty cell detection disabled - was too aggressive
+    # Caused regression from Iteration 2 (broke 01.jpg and 03.jpg)
+    # if is_likely_empty_cell(binary):
+    #     return 0, 0.0, []
+    
+    # Morphological operations to clean up digit
+    # Opening: remove small noise
+    kernel_small = np.ones((2, 2), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_small)
+    
+    # Closing: fill small gaps in digits
+    kernel_med = np.ones((3, 3), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_med)
 
     # Connected components to isolate the digit blob
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
     if num_labels <= 1:
-        return 0, 0.0
+        return 0, 0.0, []
 
-    # Skip background (label 0); choose largest remaining component
-    digit_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-    area = stats[digit_label, cv2.CC_STAT_AREA]
-    min_area = min_fill * (binary.shape[0] * binary.shape[1])
-    if area < min_area or area > 0.7 * binary.size:
-        return 0, 0.0
+    # Filter components by area and aspect ratio
+    valid_components = []
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        x, y, bw, bh = (stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP],
+                        stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT])
+        
+        min_area = min_fill * (binary.shape[0] * binary.shape[1])
+        max_area = 0.7 * binary.size
+        
+        if area < min_area or area > max_area:
+            continue
+            
+        # Check aspect ratio (digits are typically 1:1 to 1:3)
+        aspect_ratio = bh / max(bw, 1)
+        if aspect_ratio < 0.5 or aspect_ratio > 5.0:
+            continue
+            
+        valid_components.append((i, area))
+    
+    if not valid_components:
+        return 0, 0.0, []
+    
+    # Select largest valid component
+    digit_label = max(valid_components, key=lambda x: x[1])[0]
+    x, y, bw, bh = (stats[digit_label, cv2.CC_STAT_LEFT], stats[digit_label, cv2.CC_STAT_TOP],
+                    stats[digit_label, cv2.CC_STAT_WIDTH], stats[digit_label, cv2.CC_STAT_HEIGHT])
 
-    x, y, bw, bh = stats[digit_label, cv2.CC_STAT_LEFT], stats[digit_label, cv2.CC_STAT_TOP], \
-        stats[digit_label, cv2.CC_STAT_WIDTH], stats[digit_label, cv2.CC_STAT_HEIGHT]
-
+    # Extract digit ROI with padding
     pad = 2
     x1, y1 = max(0, x - pad), max(0, y - pad)
     x2, y2 = min(binary.shape[1], x + bw + pad), min(binary.shape[0], y + bh + pad)
     digit_roi = binary[y1:y2, x1:x2]
 
-    # Square-pad before resize to maintain aspect
+    # Square-pad before resize to maintain aspect ratio
     side = max(digit_roi.shape)
     square = np.zeros((side, side), dtype=np.uint8)
     y_off = (side - digit_roi.shape[0]) // 2
     x_off = (side - digit_roi.shape[1]) // 2
     square[y_off:y_off + digit_roi.shape[0], x_off:x_off + digit_roi.shape[1]] = digit_roi
 
+    # Resize to template size
     target_size = next(iter(templates.values()))[0].shape[0]
     digit_norm = cv2.resize(square, (target_size, target_size), interpolation=cv2.INTER_AREA)
+    
+    # Normalize pixel values
+    digit_norm = cv2.normalize(digit_norm, None, 0, 255, cv2.NORM_MINMAX)
 
-    # Try both normal and inverted ROI to tolerate polarity issues
+    # Try both normal and inverted ROI for robustness
     candidates = [digit_norm, cv2.bitwise_not(digit_norm)]
 
+    # Multi-method template matching with ensemble voting
     best_digit, best_score = 0, -1.0
+    digit_votes: Dict[int, List[float]] = {d: [] for d in range(1, 10)}
+    
     for candidate in candidates:
         for digit, tmpl_list in templates.items():
+            scores_for_digit = []
+            
             for tmpl in tmpl_list:
-                score = cv2.matchTemplate(candidate, tmpl, cv2.TM_CCOEFF_NORMED)[0][0]
-                if score > best_score:
-                    best_digit, best_score = digit, float(score)
+                # Try multiple matching methods
+                score_ccoeff = cv2.matchTemplate(candidate, tmpl, cv2.TM_CCOEFF_NORMED)[0][0]
+                score_ccorr = cv2.matchTemplate(candidate, tmpl, cv2.TM_CCORR_NORMED)[0][0]
+                
+                # Ensemble: weight CCOEFF more heavily
+                ensemble_score = 0.7 * score_ccoeff + 0.3 * score_ccorr
+                scores_for_digit.append(ensemble_score)
+            
+            # Take max score across all templates for this digit
+            if scores_for_digit:
+                max_score = max(scores_for_digit)
+                digit_votes[digit].append(max_score)
+    
+    # Aggregate votes: use max score for each digit
+    for digit, scores in digit_votes.items():
+        if scores:
+            avg_score = max(scores)
+            if avg_score > best_score:
+                best_digit, best_score = digit, float(avg_score)
 
-    if best_score < accept_threshold:
-        return 0, best_score
+    # Check if top match is significantly better than second-best
+    sorted_scores = sorted([(d, max(scores)) for d, scores in digit_votes.items() if scores],
+                          key=lambda x: x[1], reverse=True)
+    
+    if len(sorted_scores) >= 2:
+        top_score = sorted_scores[0][1]
+        second_score = sorted_scores[1][1]
+        confidence_margin = top_score - second_score
+        
+        # If top and second are too close, be more conservative (increased threshold)
+        if confidence_margin < 0.15:
+            accept_threshold = max(accept_threshold, 0.55)
+    
+    # NEW: Topological validation (from Iteration 1)
+    # Analyze structural features of the digit
+    features = analyze_digit_topology(digit_norm)
+    
+    # NOTE: Advanced features disabled to restore Iteration 2 functionality
+    # contour_features = analyze_contour_features(digit_norm)
+    # skeleton_features = analyze_skeleton(digit_norm)
+    
+    # Validate if best_digit matches topological features
+    if best_digit > 0 and not validate_digit_topology(best_digit, features):
+        # Topology doesn't match! Try second-best digit
+        if len(sorted_scores) >= 2:
+            second_digit = sorted_scores[1][0]
+            second_score_val = sorted_scores[1][1]
+            
+            # Check if second best matches topology
+            topology_valid_2 = validate_digit_topology(second_digit, features)
+            
+            if topology_valid_2:
+                # Use second best instead
+                best_digit = second_digit
+                best_score = second_score_val
+            else:
+                # Neither matches well - lower confidence but keep best
+                best_score *= 0.7
+    
+    # NOTE: Tesseract disabled for now - not affecting core functionality
+    tesseract_digit = 0
+    
+    # Prepare candidates list (top 3) - simplified
+    final_candidates = [(best_digit, best_score)] if best_digit > 0 else []
+    
+    # Add runner-ups
+    for d, s in sorted_scores[:3]:  # Take top 3
+        if d != best_digit and d > 0:
+            final_candidates.append((d, s))
+            if len(final_candidates) >= 3:
+                break
+    
+    # Digit-specific threshold adjustment
+    # Digits 4 and 8 are commonly false positives (empty cells, noise)
+    # Digit 8 is the worst offender - require very high confidence
+    effective_threshold = accept_threshold
+    if best_digit == 8:
+        effective_threshold = accept_threshold * 1.4  # 40% higher (0.48 -> 0.67)
+    elif best_digit == 4:
+        effective_threshold = accept_threshold * 1.25  # 25% higher (0.48 -> 0.60)
+    
+    # Apply threshold with 5% leniency
+    if best_score < effective_threshold * 0.95:
+        return 0, best_score, []
 
-    return best_digit, best_score
+    return best_digit, best_score, final_candidates
+
 
 
 def resolve_conflicts(board: np.ndarray, scores: np.ndarray, min_score_keep: float = 0.0
-                      ) -> tuple[np.ndarray, list[str]]:
+                      ) -> Tuple[np.ndarray, List[str]]:
     """
     Remove duplicate givens in rows/cols/blocks by keeping only the highest-score hit.
 
@@ -150,9 +863,9 @@ def resolve_conflicts(board: np.ndarray, scores: np.ndarray, min_score_keep: flo
         cleaned_board, list of notes about removed cells
     """
     cleaned = board.copy()
-    notes: list[str] = []
+    notes: List[str] = []
 
-    def drop_duplicates(index_list: list[tuple[int, int]], label: str):
+    def drop_duplicates(index_list: List[Tuple[int, int]], label: str):
         nonlocal cleaned, notes
         values = {}
         for r, c in index_list:
@@ -193,13 +906,14 @@ def resolve_conflicts(board: np.ndarray, scores: np.ndarray, min_score_keep: flo
     return cleaned, notes
 
 
-def extract_grid_digits(binary_grid: np.ndarray, templates: dict[int, list[np.ndarray]] | None = None
-                        ) -> tuple[np.ndarray, np.ndarray]:
+def extract_grid_digits(binary_grid: np.ndarray, templates: Optional[Dict[int, List[np.ndarray]]] = None,
+                        accept_threshold: float = 0.45
+                        ) -> Tuple[np.ndarray, np.ndarray, Dict[Tuple[int, int], List[Tuple[int, float]]]]:
     """
     Extract a 9x9 integer grid (0 = empty) from the straightened binary image.
 
     Returns:
-        board (9x9 ints), scores (9x9 floats correlation confidence)
+        board (9x9 ints), scores (9x9 floats), all_candidates (dict)
     """
     if templates is None:
         templates = build_digit_templates()
@@ -216,6 +930,7 @@ def extract_grid_digits(binary_grid: np.ndarray, templates: dict[int, list[np.nd
 
     board = np.zeros((9, 9), dtype=int)
     scores = np.zeros((9, 9), dtype=float)
+    all_candidates = {}
 
     for r in range(9):
         for c in range(9):
@@ -223,16 +938,101 @@ def extract_grid_digits(binary_grid: np.ndarray, templates: dict[int, list[np.nd
             x1, x2 = c * cell_w, (c + 1) * cell_w
             cell1 = digits_only[y1:y2, x1:x2]
             cell2 = raw_view[y1:y2, x1:x2]
-            d1, s1 = _extract_digit_from_cell(cell1, templates)
-            d2, s2 = _extract_digit_from_cell(cell2, templates)
+            
+            d1, s1, c1 = _extract_digit_from_cell(cell1, templates, accept_threshold=accept_threshold)
+            d2, s2, c2 = _extract_digit_from_cell(cell2, templates, accept_threshold=accept_threshold)
+            
             if s2 > s1:
-                digit, score = d2, s2
+                digit, score, candidates = d2, s2, c2
             else:
-                digit, score = d1, s1
+                digit, score, candidates = d1, s1, c1
+                
             board[r, c] = digit
             scores[r, c] = score
+            all_candidates[(r, c)] = candidates
 
-    return board, scores
+    return board, scores, all_candidates
+
+
+def validate_and_correct_ocr(board: np.ndarray, scores: np.ndarray, 
+                              all_candidates: Optional[Dict[Tuple[int, int], List[Tuple[int, float]]]] = None
+                              ) -> Tuple[np.ndarray, List[str]]:
+    """
+    Use Sudoku constraints to validate and correct OCR results.
+    
+    Args:
+        board: 9x9 numpy array of detected digits
+        scores: 9x9 numpy array of confidence scores  
+        all_candidates: Optional dict mapping (row, col) -> list of (digit, score) alternatives
+        
+    Returns:
+        corrected_board, list of correction notes
+    """
+    from .solver import _is_valid
+    
+    corrections = []
+    working_board = board.copy()
+    
+    # Check each cell for Sudoku constraint violations
+    for r in range(9):
+        for c in range(9):
+            digit = working_board[r, c]
+            if digit == 0:
+                continue
+            
+            # Temporarily remove digit to check if it's valid
+            working_board[r, c] = 0
+            
+            # Check if placing it back is valid
+            if _is_valid(working_board, r, c, digit):
+                # Valid, restore it
+                working_board[r, c] = digit
+            else:
+                # Conflict detected!
+                corrections.append(f"Conflict at ({r+1},{c+1}): {digit} violates Sudoku rules")
+                
+                # Try to find valid alternative from candidates
+                found_alternative = False
+                if all_candidates and (r, c) in all_candidates:
+                    candidates = all_candidates[(r, c)]
+                    # Candidates are already sorted by score
+                    for cand_digit, cand_score in candidates:
+                        if cand_digit == digit:
+                            continue # Skip the one we just failed
+                        
+                        if _is_valid(working_board, r, c, cand_digit):
+                            # Found a valid alternative!
+                            working_board[r, c] = cand_digit
+                            corrections.append(f"  → Swapped invalid {digit} for valid candidate {cand_digit} (score {cand_score:.2f})")
+                            found_alternative = True
+                            break
+                
+                if not found_alternative:
+                    corrections.append(f"  → Removed invalid digit {digit} at ({r+1},{c+1}) (no valid candidates)")
+                    # Leave cell as 0 (empty)
+    
+    return working_board, corrections
+
+
+def extract_grid_digits_with_validation(binary_grid: np.ndarray, 
+                                        templates: Optional[Dict[int, List[np.ndarray]]] = None,
+                                        accept_threshold: float = 0.45
+                                        ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """
+    Extract digits and apply puzzle-level validation.
+    
+    Returns:
+        board (9x9 ints), scores (9x9 floats), validation_notes (list of strings)
+    """
+    # First pass: extract all digits
+    board, scores, all_candidates = extract_grid_digits(binary_grid, templates, accept_threshold=accept_threshold)
+    
+    # Apply puzzle-level validation
+    validated_board, validation_notes = validate_and_correct_ocr(board, scores, all_candidates)
+    
+    return validated_board, scores, validation_notes
+
+
 
 
 def format_board(board: np.ndarray) -> str:

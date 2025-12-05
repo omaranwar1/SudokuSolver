@@ -288,7 +288,11 @@ class SudokuSolver:
             print(f"      ✓ Grid is complete, no reinforcement needed")
 
         print("\n[6/6] OCR (pattern matching) and solving...")
-        board_raw, scores = extract_grid_digits(final_binary)
+        cells_dir = None
+        if self.save_intermediate:
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            cells_dir = os.path.join(output_dir, f"{base_name}_cells")
+        board_raw, scores = extract_grid_digits(final_binary, save_cells_dir=cells_dir)
         board, conflict_notes = resolve_conflicts(board_raw, scores)
         print("\n      Detected puzzle:")
         print(format_board(board))

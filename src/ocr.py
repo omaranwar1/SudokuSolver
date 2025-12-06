@@ -407,9 +407,8 @@ def extract_grid_digits(
                 if board[r, c] == 0 or score > scores[r, c]:
                     board[r, c] = digit
                     scores[r, c] = score
-                    if save_cells_dir and debug:
-                        suffix = "" if not use_fallback else "_fb"
-                        cv2.imwrite(os.path.join(save_cells_dir, f"r{r}_c{c}{suffix}.png"), chosen_cell)
+                    if save_cells_dir and not use_fallback:
+                        cv2.imwrite(os.path.join(save_cells_dir, f"r{r}_c{c}.png"), chosen_cell)
 
     run_pass(use_fallback=False, margin=inner_margin)
 

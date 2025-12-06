@@ -384,6 +384,8 @@ Examples:
                         help='Output grid size in pixels (default: 450)')
     parser.add_argument('--no-save', action='store_true',
                         help='Do not save intermediate images')
+    parser.add_argument('--binary-grid', action='store_true',
+                        help='Treat input image as an already straightened binary grid (skip detection)')
 
     args = parser.parse_args()
 
@@ -391,6 +393,29 @@ Examples:
     if not os.path.exists(args.image):
         print(f"Error: Image file not found: {args.image}")
         sys.exit(1)
+
+    # If user provides a pre-straightened binary grid, skip the full pipeline
+    if args.binary_grid:
+        img = cv2.imread(args.image, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            print(f"Error: Could not load binary grid from {args.image}")
+            sys.exit(1)
+        # Ensure binary polarity: digits white on black
+        _, bin_img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if bin_img.mean() > 127:
+            bin_img = cv2.bitwise_not(bin_img)
+        os.makedirs(args.output, exist_ok=True)
+        base = os.path.splitext(os.path.basename(args.image))[0]
+        cells_dir = os.path.join(args.output, f"{base}_cells")
+        board_raw, scores = extract_grid_digits(bin_img, save_cells_dir=cells_dir)
+        board, conflict_notes = resolve_conflicts(board_raw, scores)
+        print("\nDetected puzzle (binary input):")
+        print(format_board(board))
+        if conflict_notes:
+            print("Note: cleaned duplicate detections:")
+            for note in conflict_notes:
+                print(f"  - {note}")
+        sys.exit(0)
 
     # Create solver instance
     solver = SudokuSolver(

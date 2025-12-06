@@ -337,6 +337,131 @@ def is_likely_empty_cell(binary_image: np.ndarray) -> bool:
     return False
 
 
+def validate_detected_digit(binary_image: np.ndarray, detected_digit: int, score: float) -> bool:
+    """
+    Multi-factor validation to filter false positives.
+    
+    Combines:
+    1. Score threshold (higher for prone-to-false-positive digits)
+    2. Aspect ratio check (digit 1 should be tall and narrow)
+    3. White pixel density (real digits have substantial fill)
+    4. Connected component analysis (reject fragmented noise)
+    
+    Args:
+        binary_image: The cell image with the detected digit
+        detected_digit: The digit detected by template matching
+        score: The template matching confidence score
+    
+    Returns:
+        True if the digit passes validation, False if likely false positive
+    """
+    if detected_digit == 0:
+        return True  # Empty cell, nothing to validate
+    
+    if binary_image.size == 0:
+        return False
+    
+    h, w = binary_image.shape[:2]
+    
+    # === 1. Score threshold - RAISED for better filtering ===
+    # Digits 1 and 4 need very high confidence
+    if detected_digit == 1:
+        min_score = 0.70
+    elif detected_digit == 4:
+        min_score = 0.72  # Even higher for 4
+    else:
+        min_score = 0.58  # Raised from 0.55
+    
+    if score < min_score:
+        return False
+    
+    # === 2. White pixel density check ===
+    white_pixels = cv2.countNonZero(binary_image)
+    total_pixels = binary_image.size
+    density = white_pixels / total_pixels if total_pixels > 0 else 0
+    
+    # Digits should have 4-35% fill
+    if density < 0.04 or density > 0.35:
+        return False
+    
+    # === 3. Connected component check - reject fragmented noise ===
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_image, connectivity=8)
+    
+    # Too many components = fragmented noise
+    if num_labels > 5:
+        return False
+    
+    # Find largest component (skip background at index 0)
+    if num_labels > 1:
+        areas = [stats[i, cv2.CC_STAT_AREA] for i in range(1, num_labels)]
+        largest_area = max(areas) if areas else 0
+        total_white = sum(areas)
+        
+        # Largest component should be majority of white pixels (>60%)
+        if total_white > 0 and largest_area / total_white < 0.6:
+            return False
+        
+        # Largest component needs minimum size
+        if largest_area < total_pixels * 0.02:
+            return False
+    
+    # === 4. Aspect ratio check for digit 1 ===
+    if detected_digit == 1:
+        coords = cv2.findNonZero(binary_image)
+        if coords is not None and len(coords) > 10:
+            x, y, bw, bh = cv2.boundingRect(coords)
+            aspect = bh / bw if bw > 0 else 1
+            
+            # Digit 1 should be tall and narrow (aspect ratio > 2.0)
+            if aspect < 2.0:
+                return False
+            
+            # Width should be narrow
+            width_ratio = bw / w
+            if width_ratio > 0.45:
+                return False
+    
+    # === 5. Stricter validation for digit 4 ===
+    if detected_digit == 4:
+        coords = cv2.findNonZero(binary_image)
+        if coords is not None and len(coords) > 10:
+            x, y, bw, bh = cv2.boundingRect(coords)
+            aspect = bh / bw if bw > 0 else 1
+            
+            # Digit 4: aspect ratio 1.2-2.3
+            if aspect > 2.3 or aspect < 1.2:
+                return False
+            
+            # Width at least 35% of cell
+            width_ratio = bw / w
+            if width_ratio < 0.35:
+                return False
+            
+            # Height at least 50% of cell
+            height_ratio = bh / h
+            if height_ratio < 0.50:
+                return False
+    
+    return True
+
+
+def get_harris_corner_count(binary_image: np.ndarray) -> int:
+    """
+    Count Harris corners in a binary image.
+    Useful for debugging and tuning thresholds.
+    """
+    if binary_image.size == 0:
+        return 0
+    
+    gray = binary_image.astype(np.float32)
+    harris = cv2.cornerHarris(gray, blockSize=2, ksize=3, k=0.04)
+    
+    threshold = 0.01 * harris.max() if harris.max() > 0 else 0
+    corners = harris > threshold
+    
+    return int(np.sum(corners))
+
+
 def analyze_contour_features(binary_image: np.ndarray) -> Optional[Dict[str, float]]:
     """
     Extract detailed contour-based shape descriptors.
@@ -511,57 +636,82 @@ def validate_digit_with_advanced_features(predicted_digit: int,
 
 
 def _extract_digit_with_sliding_window(cell: np.ndarray, templates: Dict[int, List[np.ndarray]],
-                                       step_sizes: List[float] = [0.2, 0.5, 1.0]) -> Tuple[int, float, List[Tuple[int, float]]]:
+                                       step_sizes: List[float] = [0.4, 1.0],
+                                       window_scales: List[float] = [0.7, 0.85, 1.0]) -> Tuple[int, float, List[Tuple[int, float]]]:
     """
-    Extract digit using sliding window with multiple scales and positions.
+    Extract digit using enhanced sliding window with multiple window sizes and positions.
     
-    This tests multiple window sizes and positions to find the best match,
-    helping with digits that aren't perfectly centered or sized.
+    Fast version with minimal configurations but better coverage than the original.
+    Key changes from original:
+    - More window scales (0.7, 0.85, 1.0) vs (0.7, 0.85, 1.0, 1.15)
+    - Fewer step sizes (0.4, 1.0) - medium and full step only
+    - No aspect ratio variations
+    - Voting-based candidate selection
     
     Args:
         cell: Input cell image
         templates: Digit templates
-        step_sizes: List of step sizes as fraction of window size (0.2 = 20% steps)
+        step_sizes: List of step sizes as fraction of window size
+        window_scales: List of scales relative to cell size
     
     Returns:
         (best_digit, best_score, candidates)
     """
     h, w = cell.shape
     
-    # Test different scales of the window (relative to cell size)
-    # 0.7 = smaller window (tighter crop around digit)
-    # 1.0 = full cell
-    # 1.3 = slightly larger (in case digit extends to edges)
-    scales = [0.7, 0.85, 1.0, 1.15]
-    
     best_digit = 0
     best_score = 0.0
     all_results = {}  # digit -> list of scores
     
-    for scale in scales:
-        # Window size at this scale
-        win_h = int(h * scale)
-        win_w = int(w * scale)
-        
-        # Ensure window fits in cell
-        win_h = min(win_h, h)
-        win_w = min(win_w, w)
-        
-        # Try multiple step sizes for this scale
+    # Simple window configurations based on scales only
+    window_configs = []
+    for scale in window_scales:
+        win_size = int(min(h, w) * scale)
+        win_size = min(win_size, min(h, w))
+        if win_size >= 15:
+            window_configs.append(win_size)
+    
+    # Remove duplicates
+    window_configs = list(set(window_configs))
+    
+    # Process each window size
+    for win_size in window_configs:
         for step_frac in step_sizes:
-            step_y = max(1, int(win_h * step_frac))
-            step_x = max(1, int(win_w * step_frac))
+            step = max(2, int(win_size * step_frac))
             
-            # Slide window across cell
-            for y in range(0, h - win_h + 1, step_y):
-                for x in range(0, w - win_w + 1, step_x):
-                    # Extract window
-                    window = cell[y:y+win_h, x:x+win_w]
-                    
-                    # Use existing extraction logic on this window
+            # Key positions: corners, center, and stepped positions
+            y_positions = [0]  # Top
+            x_positions = [0]  # Left
+            
+            # Center
+            center_y = (h - win_size) // 2
+            center_x = (w - win_size) // 2
+            
+            # Edge
+            edge_y = max(0, h - win_size)
+            edge_x = max(0, w - win_size)
+            
+            # Add stepped positions if step_frac < 1.0
+            if step_frac < 1.0:
+                for y in range(step, edge_y, step):
+                    y_positions.append(y)
+                for x in range(step, edge_x, step):
+                    x_positions.append(x)
+            
+            # Add center and edges
+            y_positions.extend([center_y, edge_y])
+            x_positions.extend([center_x, edge_x])
+            
+            # Remove duplicates and filter valid
+            y_positions = sorted(set(p for p in y_positions if 0 <= p <= h - win_size))
+            x_positions = sorted(set(p for p in x_positions if 0 <= p <= w - win_size))
+            
+            for y in y_positions:
+                for x in x_positions:
+                    window = cell[y:y+win_size, x:x+win_size]
                     digit, score, _ = _extract_digit_from_cell_core(window, templates)
                     
-                    if digit > 0:
+                    if digit > 0 and score > 0.50:  # Raised threshold to reduce false positives
                         if digit not in all_results:
                             all_results[digit] = []
                         all_results[digit].append(score)
@@ -570,11 +720,50 @@ def _extract_digit_with_sliding_window(cell: np.ndarray, templates: Dict[int, Li
                             best_score = score
                             best_digit = digit
     
-    # Build candidate list from aggregated results
+    # Build candidate list with voting
     candidates = []
-    for digit in sorted(all_results.keys(), key=lambda d: max(all_results[d]), reverse=True)[:3]:
-        max_score = max(all_results[digit])
-        candidates.append((digit, max_score))
+    digit_stats = {}
+    
+    for digit, scores in all_results.items():
+        max_score = max(scores)
+        avg_score = sum(scores) / len(scores)
+        count = len(scores)
+        
+        # Skip if max score is too low (likely noise)
+        if max_score < 0.50:
+            continue
+        
+        # Combined score: max score + bonus for consistency
+        combined = max_score * 0.85 + avg_score * 0.1 + min(count / 10.0, 0.05)
+        digit_stats[digit] = {'max': max_score, 'avg': avg_score, 'count': count, 'combined': combined}
+    
+    sorted_digits = sorted(digit_stats.keys(), key=lambda d: digit_stats[d]['combined'], reverse=True)
+    
+    for digit in sorted_digits[:3]:
+        candidates.append((digit, digit_stats[digit]['max']))
+    
+    # Use voting winner if max_score is not highly confident
+    if best_score < 0.55 and sorted_digits:
+        if digit_stats[sorted_digits[0]]['combined'] > digit_stats.get(best_digit, {}).get('combined', 0):
+            best_digit = sorted_digits[0]
+            best_score = digit_stats[sorted_digits[0]]['max']
+    
+    # Multi-factor validation - reject false positives
+    if best_digit > 0:
+        if not validate_detected_digit(cell, best_digit, best_score):
+            # Failed validation - likely false positive
+            # Try next best candidate
+            for candidate in candidates:
+                cand_digit, cand_score = candidate
+                if cand_digit != best_digit and cand_digit != 0:
+                    if validate_detected_digit(cell, cand_digit, cand_score):
+                        best_digit = cand_digit
+                        best_score = cand_score
+                        break
+            else:
+                # No valid candidate - mark as empty
+                best_digit = 0
+                best_score = 0.0
     
     return best_digit, best_score, candidates
 
@@ -1080,3 +1269,94 @@ def render_solution_on_image(image: np.ndarray, solved: np.ndarray, original: np
             cv2.putText(canvas, text, (x, y), font, 0.9, color, 2, cv2.LINE_AA)
 
     return canvas
+
+
+def render_ocr_detection(image: np.ndarray, board: np.ndarray, scores: np.ndarray,
+                         show_confidence: bool = True) -> np.ndarray:
+    """
+    Overlay OCR detection results on the straightened image with confidence visualization.
+    
+    Colors indicate confidence level:
+    - Green (>70%): High confidence detection
+    - Yellow/Orange (50-70%): Medium confidence detection  
+    - Red (<50%): Low confidence detection
+    - Empty cells show small X marker
+    
+    Args:
+        image: Straightened grid image
+        board: 9x9 numpy array of detected digits (0 = empty)
+        scores: 9x9 numpy array of confidence scores (0.0 to 1.0)
+        show_confidence: If True, show confidence percentage below digit
+    
+    Returns:
+        Annotated image with OCR detections visualized
+    """
+    if image.ndim == 2:
+        canvas = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    else:
+        canvas = image.copy()
+
+    h, w = canvas.shape[:2]
+    cell_h = h // 9
+    cell_w = w // 9
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    
+    # Draw grid lines for clarity
+    for i in range(10):
+        thickness = 3 if i % 3 == 0 else 1
+        y = int(i * cell_h)
+        cv2.line(canvas, (0, y), (w, y), (80, 80, 80), thickness)
+        x = int(i * cell_w)
+        cv2.line(canvas, (x, 0), (x, h), (80, 80, 80), thickness)
+
+    for r in range(9):
+        for c in range(9):
+            val = int(board[r, c])
+            score = float(scores[r, c])
+            
+            cx = c * cell_w + cell_w // 2
+            cy = r * cell_h + cell_h // 2
+            
+            if val == 0:
+                # Empty cell - draw small X
+                size = 5
+                cv2.line(canvas, (cx - size, cy - size), (cx + size, cy + size), (100, 100, 100), 1)
+                cv2.line(canvas, (cx - size, cy + size), (cx + size, cy - size), (100, 100, 100), 1)
+                continue
+            
+            # Color based on confidence
+            if score >= 0.70:
+                color = (0, 255, 0)       # Green - high confidence
+            elif score >= 0.50:
+                color = (0, 200, 255)     # Orange - medium confidence
+            else:
+                color = (0, 0, 255)       # Red - low confidence
+            
+            # Draw digit
+            text = str(val)
+            font_scale = 1.0
+            thickness = 2
+            size_text, _ = cv2.getTextSize(text, font, font_scale, thickness)
+            
+            tx = cx - size_text[0] // 2
+            ty = cy + size_text[1] // 2 - (5 if show_confidence else 0)
+            
+            # Draw text with black outline
+            cv2.putText(canvas, text, (tx, ty), font, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+            cv2.putText(canvas, text, (tx, ty), font, font_scale, color, thickness, cv2.LINE_AA)
+            
+            if show_confidence:
+                conf_text = f"{int(score * 100)}%"
+                conf_size, _ = cv2.getTextSize(conf_text, font, 0.35, 1)
+                conf_x = cx - conf_size[0] // 2
+                conf_y = cy + cell_h // 3
+                cv2.putText(canvas, conf_text, (conf_x, conf_y), font, 0.35, color, 1, cv2.LINE_AA)
+
+    # Legend
+    legend_y = h - 10
+    cv2.putText(canvas, "High", (10, legend_y), font, 0.35, (0, 255, 0), 1)
+    cv2.putText(canvas, "Med", (55, legend_y), font, 0.35, (0, 200, 255), 1)
+    cv2.putText(canvas, "Low", (95, legend_y), font, 0.35, (0, 0, 255), 1)
+
+    return canvas
+

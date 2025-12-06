@@ -24,7 +24,7 @@ from .grid_detection import (
     detect_blocked_corners
 )
 from .perspective_transform import perspective_transform, get_transform_quality_score
-from .ocr import extract_grid_digits, format_board, render_solution_on_image, resolve_conflicts
+from .ocr import extract_grid_digits, format_board, render_solution_on_image, resolve_conflicts, render_ocr_detection
 from .solver import solve_puzzle
 
 
@@ -288,8 +288,18 @@ class SudokuSolver:
             print(f"      ✓ Grid is complete, no reinforcement needed")
 
         print("\n[6/6] OCR (pattern matching) and solving...")
-        board_raw, scores = extract_grid_digits(final_binary)
+        board_raw, scores, all_candidates = extract_grid_digits(final_binary)
         board, conflict_notes = resolve_conflicts(board_raw, scores)
+        
+        # Save OCR detection visualization
+        ocr_detection_viz = render_ocr_detection(
+            self.intermediate_images['straightened'],
+            board_raw,  # Show raw detections before conflict resolution
+            scores,
+            show_confidence=True
+        )
+        self.intermediate_images['ocr_detection'] = ocr_detection_viz
+        
         print("\n      Detected puzzle:")
         print(format_board(board))
         if conflict_notes:

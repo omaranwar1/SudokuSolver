@@ -6,6 +6,12 @@ Approach:
 2) Discard empty cells using pixel coverage.
 3) For remaining cells, resize the digit mask and compare against
    generated template digits using normalized cross correlation.
+
+ENHANCED with fixes for:
+- Inverted images (white digits on black)
+- Noisy backgrounds with dots/speckles
+- Better empty cell detection
+- More robust template matching
 """
 
 import os
@@ -26,6 +32,8 @@ def build_digit_templates(
     """
     Generate digit templates (1-9) with multiple fonts, stroke widths, rotations,
     and slight morphological tweaks.
+    
+    ENHANCED: Now includes noisy variants for better matching with degraded images.
     """
     templates: dict[int, list[np.ndarray]] = {}
     kernel = np.ones((2, 2), np.uint8)
@@ -49,9 +57,22 @@ def build_digit_templates(
                     for angle in rotations:
                         M = cv2.getRotationMatrix2D((size / 2, size / 2), angle, 1.0)
                         rotated = cv2.warpAffine(canvas, M, (size, size), flags=cv2.INTER_LINEAR, borderValue=0)
+                        
+                        # Original variants
                         variants.append(rotated)
                         variants.append(cv2.erode(rotated, kernel, iterations=1))
                         variants.append(cv2.dilate(rotated, kernel, iterations=1))
+                        
+                        # NEW: Add noisy variants for images with background noise
+                        noisy = rotated.copy()
+                        noise_mask = np.random.random(noisy.shape) > 0.97
+                        noisy[noise_mask] = 255
+                        variants.append(noisy)
+                        
+                        # NEW: Add slightly broken strokes
+                        broken = cv2.erode(rotated, kernel, iterations=2)
+                        variants.append(broken)
+                        
         templates[digit] = variants
 
     return templates
@@ -112,6 +133,11 @@ def _extract_digit_from_cell(
 ) -> tuple[int, float]:
     """
     Recognize a digit from a single cell image.
+    
+    ENHANCED with:
+    - Better noise removal (removes background dots)
+    - Smarter empty cell detection
+    - Improved blob filtering
 
     Returns:
         (digit, score) where digit=0 means empty cell.
@@ -145,23 +171,16 @@ def _extract_digit_from_cell(
 
     # Quick empty check based on overall ink coverage
     coverage = binary.mean() / 255.0
-    coverage_floor = 0.003 if fallback else 0.005
-    if coverage < coverage_floor:
-        # Try inverted polarity before giving up
-        inv = make_binary(cv2.bitwise_not(work))
-        coverage_inv = inv.mean() / 255.0
-        if coverage_inv > coverage:
-            binary = inv
-            coverage = coverage_inv
-            if debug:
-                print(f"[OCR] used inverted binary, coverage={coverage:.4f}")
-        else:
-            if debug:
-                print(f"[OCR] reject by coverage={coverage:.4f}")
-            return 0, 0.0
+    
+    # ENHANCED: Very low coverage definitely means empty
+    if coverage < 0.001:
+        if debug:
+            print(f"[OCR] Empty - coverage too low ({coverage:.4f})")
+        return 0, 0.0
 
     # Connected components to isolate the digit blob
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    
     if num_labels <= 1:
         # Adaptive fallback
         adapt = cv2.adaptiveThreshold(
@@ -171,14 +190,50 @@ def _extract_digit_from_cell(
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(adapt, connectivity=8)
         if num_labels <= 1:
             if debug:
-                print("[OCR] no blobs even after adaptive")
+                print("[OCR] Empty - no blobs even after adaptive")
             return 0, 0.0
         binary = adapt
 
-    # Skip background (label 0); choose largest remaining component
-    digit_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    # ENHANCED: Smarter empty detection for noisy backgrounds
+    # Skip background (label 0); find largest component
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    if len(areas) == 0:
+        if debug:
+            print("[OCR] Empty - no valid blobs")
+        return 0, 0.0
+    
+    largest_area = np.max(areas)
+    total_area = binary.shape[0] * binary.shape[1]
+    
+    # Empty if largest blob is too small
+    min_area = min_fill * total_area
+    if largest_area < min_area:
+        if debug:
+            print(f"[OCR] Empty - largest blob only {largest_area/total_area:.1%} of cell")
+        return 0, 0.0
+    
+    # ENHANCED: If we have many small blobs (>10) but no dominant one, likely noise
+    if num_labels > 10 and largest_area < 0.1 * total_area:
+        if debug:
+            print(f"[OCR] Empty - {num_labels} fragments, no dominant blob")
+        return 0, 0.0
+
+    # ENHANCED: Keep only the largest blob to remove noise dots
+    digit_label = 1 + np.argmax(areas)
     area = stats[digit_label, cv2.CC_STAT_AREA]
-    min_area = min_fill * (binary.shape[0] * binary.shape[1])
+    
+    # Check if we're removing significant noise
+    noise_pixels = binary.sum() / 255.0 - area
+    if noise_pixels > 0.3 * (binary.sum() / 255.0):
+        if debug:
+            print(f"[OCR] Removing {noise_pixels / (binary.sum() / 255.0):.1%} noise pixels")
+    
+    # Create clean mask with only largest blob
+    mask = np.zeros_like(binary)
+    mask[labels == digit_label] = 255
+    binary = mask
+
+    # Final area check
     area_high = 0.90 if fallback else 0.80
     if area < min_area or area > area_high * binary.size:
         if debug:
@@ -207,13 +262,11 @@ def _extract_digit_from_cell(
             print(f"[OCR] reject by size: bw={bw}, bh={bh}")
         return 0, 0.0
 
-    # Mask out everything except the chosen blob to ignore stray noise
-    mask = np.zeros_like(binary)
-    mask[labels == digit_label] = 255
+    # Extract and pad the digit ROI
     pad = 2
     x1, y1 = max(0, x - pad), max(0, y - pad)
     x2, y2 = min(binary.shape[1], x + bw + pad), min(binary.shape[0], y + bh + pad)
-    digit_roi = mask[y1:y2, x1:x2]
+    digit_roi = binary[y1:y2, x1:x2]
 
     # Square-pad before resize to maintain aspect
     side = max(digit_roi.shape)
@@ -355,6 +408,11 @@ def extract_grid_digits(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Extract a 9x9 integer grid (0 = empty) from the straightened binary image.
+    
+    ENHANCED with:
+    - Global polarity detection (fixes white-on-black images)
+    - Pre-cleaning for noisy backgrounds
+    - Better handling of inverted images
 
     Args:
         binary_grid: Final binary grid (digits/lines white on black).
@@ -369,13 +427,44 @@ def extract_grid_digits(
     if templates is None:
         templates = build_digit_templates()
 
+    # ENHANCED: Global polarity check
+    # Sample edges (likely grid lines) to detect inverted images
+    h, w = binary_grid.shape
+    edge_sample = np.concatenate([
+        binary_grid[0, :],      # top row
+        binary_grid[-1, :],     # bottom row
+        binary_grid[:, 0],      # left column
+        binary_grid[:, -1]      # right column
+    ])
+    
+    polarity_inverted = False
+    if edge_sample.mean() > 180:
+        print("[OCR] Detected inverted image (white-on-black) - flipping polarity globally")
+        binary_grid = cv2.bitwise_not(binary_grid)
+        polarity_inverted = True
+
     # Prepare two views: with grid lines removed, and the raw inverted
     digits_only = remove_grid_lines(binary_grid)
     raw_view = binary_grid.copy()
     if raw_view.mean() > 127:
         raw_view = cv2.bitwise_not(raw_view)
 
-    h, w = digits_only.shape
+    # ENHANCED: Pre-clean for noisy images
+    # Detect if we have a speckled background
+    edge_noise = cv2.Laplacian(digits_only, cv2.CV_64F).var()
+    
+    if edge_noise > 5000:  # High edge variance = noisy
+        print(f"[OCR] Noisy background detected (noise level: {edge_noise:.0f}) - applying aggressive cleanup")
+        
+        # Morphological opening to remove small dots
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        digits_only = cv2.morphologyEx(digits_only, cv2.MORPH_OPEN, kernel, iterations=2)
+        
+        # Median filter to smooth remaining noise
+        digits_only = cv2.medianBlur(digits_only, 3)
+        
+        print("[OCR] Pre-cleaning complete")
+
     cell_h = h // 9
     cell_w = w // 9
     # Ignore a small border inside each cell to avoid grid lines bleeding into OCR

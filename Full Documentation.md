@@ -1,171 +1,163 @@
-# **Sudoku Solver - Computer Vision Project**
+# Sudoku Solver - Computer Vision Project
 
 **CSCE 4603 Fundamentals of Computer Vision**  
 **Omar Anwar, Amal Fouda, Ahmed Elbarbary, Farida Bey**
 
 ---
 
-## **1. Introduction**
+## 1) Introduction
 
-This project implements a complete **Sudoku Solver** using computer vision techniques. The system takes an image of a Sudoku puzzle, preprocesses it, detects the grid, extracts digits via OCR, solves the puzzle, and outputs the solution overlaid on the straightened grid. The implementation avoids machine learning for OCR, relying instead on **pattern matching and geometric transformations**.
+End-to-end Sudoku solver from a single photo. The system:
+- Cleans the image (noise, lighting, polarity, rotation).  
+- Detects the grid with redundant strategies (contour-first, Hough fallback).  
+- Straightens via homography and repairs missing lines.  
+- Extracts digits using handcrafted template matching (no ML).  
+- Solves the puzzle with a backtracking engine and overlays the solution.  
+
+Design goals: robust to uneven lighting, moderate skew, partial grid breaks, and template-friendly OCR without training.
 
 ---
 
-## **2. Project Structure**
+## 2) System Map
 
 ```
-src/
-├── __init__.py              # Package metadata
-├── __main__.py              # Entry point
-├── preprocessing.py         # Image enhancement and binarization
-├── grid_detection.py        # Grid contour and corner detection
-├── perspective_transform.py # Homography and grid straightening
-├── ocr.py                   # Digit recognition via template matching
-├── solver.py                # Backtracking Sudoku solver
-├── sudoku_solver.py         # Main pipeline orchestrator
-└── requirements.txt         # Dependencies
+Input image
+   └── preprocess (grayscale → denoise → brightness normalize → threshold → complete lines → optional rotation)
+       └── grid detection (contour-based + line-based fallback, corner validation)
+           └── perspective transform (square warp, quality scoring)
+               └── grid reinforcement (fill missing lines post-warp)
+                   └── OCR (template matching, duplicate cleanup, candidate selection)
+                       └── solver (validated backtracking with step cap)
+                           └── render solution + save intermediates
 ```
 
 ---
 
-## **3. Pipeline Overview**
+## 3) Key Modules
 
-### **Step 1: Image Preprocessing (`preprocessing.py`)**
+### preprocessing.py
+- **Noise typing** (`detect_noise_type`): Gaussian vs salt-and-pepper; Laplacian variance used as strength proxy.  
+- **Adaptive denoise** (`remove_gaussian_noise`, `remove_salt_pepper_noise`): NLM/bilateral stacks for Gaussian; multi-pass median for impulse noise with level-aware presets.  
+- **Brightness normalization** (`normalize_brightness`): Gamma selected from mean brightness; optional local flat-field equalization; CLAHE auto-applied for low contrast.  
+- **Polarity check**: Invert if dark-majority pixels indicate white-on-black content.  
+- **Thresholding**: Standard adaptive Gaussian for typical scenes; **subimage Otsu/adaptive grid** (`adaptive_threshold_subimages`) for noisy/uneven illumination.  
+- **Grid completion** (`complete_grid_lines`): Morphological open/dilate for orthogonal lines, blending back and sealing gaps.  
+- **Rotation** (`detect_rotation_robust` + `apply_rotation`): Hough-based angle estimation with conservative confidence; only rotates when horizontal/vertical medians agree.  
+- **Outputs**: original image, enhanced grayscale (for warping), binary mask (for detection/OCR).
 
-- **Input**: RGB image (file path or array).
-- **Steps**:
-  1. Convert to grayscale.
-  2. Detect noise type (Gaussian/salt-and-pepper) and apply adaptive denoising.
-  3. Normalize brightness using gamma correction and CLAHE.
-  4. Apply adaptive thresholding (Otsu for good regions, Gaussian adaptive for poor ones).
-  5. Complete broken grid lines using morphological operations.
-  6. Detect and correct rotation via Hough line analysis.
-- **Output**: Clean binary image with enhanced grid structure.
+### grid_detection.py
+- **Contour path** (`find_largest_contour` → `find_grid_corners`): convex hull, multi-epsilon polygon approximation, merge close vertices, extreme-corner fallback, geometry validation (distinctness, convexity, angle bounds), ordered TL-TR-BR-BL.  
+- **Line path** (`detect_grid_using_lines`): Hough lines → angle split → clustering with outlier removal (`cluster_lines_improved`, `remove_line_outliers`, `select_grid_lines`) → corners from boundary intersections; equation-based refinement gated by aspect ratio.  
+- **Quality checks**: squareness tolerance (`validate_grid_is_square`), transform quality score, in-bounds clipping.  
+- **Occlusion detector** (`detect_blocked_corners`): compares contour vs line corners to flag blocked vertices.  
+- **Visualization**: overlay 9×9 lines on detected quadrilateral (`draw_9x9_grid_lines`).  
+- **Reinforcement helpers**:  
+  - `reinforce_grid_morphological`: extend detected lines, add missing ones if coverage is low, preserve digits.  
+  - `reinforce_grid_hough`: re-detect lines post-warp and extend to full span.  
+  - `reinforce_grid_adaptive`: scan expected 10 line positions; fill when coverage <30% (gap-driven).  
+  - `draw_template_grid`: synthetic 9×9 mask for severe breaks.
 
----
+### perspective_transform.py
+- Homography via `cv2.getPerspectiveTransform` / `warpPerspective` to a square (default 450×450).  
+- Quality scoring (`get_transform_quality_score`) from side ratios and angle consistency; `apply_adaptive_transform` can reject low-quality grids.  
+- `visualize_transformation` helper for side-by-side debug plots.
 
-### **Step 2: Grid Detection (`grid_detection.py`)**
+### ocr.py (pipeline default)
+- **Template source**: PNGs in `digit_templates/` generated by `scripts/generate_digit_templates.py`; optional stroke augmentations.  
+- **Cell extraction**: split straightened binary grid into 81 cells; remove grid bleed by clearing borders; keep the largest blob (digit).  
+- **Matching**: weighted NCC + optional IoU/hole-count penalties to disambiguate 6/8/9 variants; supports multiple templates per digit.  
+- **Conflict resolution** (`resolve_conflicts`): drop duplicates in rows/cols/blocks based on confidence scores; warns when conflicts remain.  
+- **Debug**: `score_cell_against_templates` for per-digit scores; saves cell crops when `--no-save` is not set.
 
-- **Hybrid Detection Strategy**:
-  - **Contour-based**: Find largest quadrilateral contour → refine corners.
-  - **Line-based**: Use Hough transform to detect grid lines → compute intersections.
-  - **Adaptive Selection**: Score both methods based on quality, aspect ratio, and coverage → pick best.
-- **Corner Refinement**:
-  - Merge close points, refine via Harris corner detection, validate geometry.
-- **Output**: Four ordered corners (TL, TR, BR, BL).
+### ocr_pattern.py (standalone strict matcher)
+- Normalizes a single cell to centered 50×50 glyphs, isolates largest component, and matches via weighted NCC + IoU with gap/threshold gating.  
+- Useful for unit-testing templates or integrating OCR separately.
 
----
+### solver.py
+- Validates givens to catch duplicate numbers in rows/cols/blocks before search.  
+- Depth-first backtracking with `_is_valid` constraints; configurable step cap (default 200k) to avoid runaway searches.  
+- Returns solved board or an explicit failure reason.
 
-### **Step 3: Perspective Transformation (`perspective_transform.py`)**
-
-- Compute homography matrix using `cv2.getPerspectiveTransform`.
-- Map detected corners to a square (default 450×450).
-- Apply warp transformation with bilinear interpolation.
-- **Quality Check**: Evaluate aspect ratio and corner angles to reject poor transforms.
-
----
-
-### **Step 4: Grid Reinforcement**
-
-- After straightening, check for missing/broken grid lines.
-- **Method**: Scan expected line positions, fill gaps if coverage < 30%.
-- Ensures a complete 9×9 grid for reliable cell segmentation.
-
----
-
-### **Step 5: OCR – Digit Recognition (`ocr.py`)**
-
-- **Template Generation**: Create multiple variants of digits 1–9 with different fonts, thicknesses, rotations, and noise.
-- **Cell Processing**:
-  - Split grid into 81 cells.
-  - Remove grid lines via morphology.
-  - Detect largest connected component (the digit).
-  - Normalize to 28×28 pixels.
-- **Matching**:
-  - Compare cell against all templates using normalized cross-correlation (NCC) and IoU.
-  - Apply hole-count penalties (e.g., ‘8’ has 2 holes, ‘6’ has 1).
-  - Accept digit if score > threshold and separation from second-best is sufficient.
-- **Conflict Resolution**: Remove duplicate digits in rows/columns/blocks, keeping highest-confidence detection.
+### sudoku_solver.py (orchestrator/CLI)
+- Drives the full pipeline: preprocess → detect grid (contour-first, line fallback) → warp → reinforce → OCR (contour vs line candidate selection) → solve → render.  
+- Stores intermediate artifacts (original, preprocessed, contour viz, straightened color/binary, reinforced binary, solved overlay, optional cell crops).  
+- Warns on low givens (<15) and unsolved boards; selects OCR candidate with fewer conflicts and more givens.
 
 ---
 
-### **Step 6: Sudoku Solving (`solver.py`)**
+## 4) Algorithms and Parameters (selected)
 
-- **Validation**: Check for duplicate givens in rows, columns, blocks.
-- **Backtracking**: Recursive DFS with constraint propagation.
-- **Step Limit**: Cap at 200,000 expansions to avoid infinite loops.
-- **Output**: Solved 9×9 board or error message.
-
----
-
-### **Step 7: Visualization & Output (`sudoku_solver.py`)**
-
-- Overlay solution digits (green) onto straightened image.
-- Save intermediate images for debugging.
-- Print detected and solved boards in readable format.
+- **Noise thresholds**: Laplacian variance gates denoise presets (e.g., >40k = heavy NLM + bilateral for Gaussian).  
+- **Brightness**: Gamma choices: 3.5 (very dark), 2.5 (dark), 1.0 (normal), 0.6 (too bright) + CLAHE when std <40.  
+- **Adaptive thresholding**: block size 15, C=3 for Gaussian adaptive; subimage grid defaults to 4×4 with Otsu when bimodal.  
+- **Grid area filter**: contour must exceed 20% of image area.  
+- **Corner geometry**: internal angles constrained (60°–120°); corners must be distinct; convexity enforced.  
+- **Line clustering**: tolerance ~10 px; outliers removed via IQR; target 10 lines per axis with even-spacing heuristic.  
+- **Reinforcement**: missing line drawn when coverage <10% (morph) or <30% (adaptive gap fill); full synthetic grid used if extended-line pixels are extremely sparse.  
+- **OCR acceptance**: weighted NCC/IoU scoring; rejection when top score below threshold or gap to second-best too small (protects against ambiguous strokes).  
+- **Solver cap**: default 200,000 recursive expansions; early exit if invalid givens.
 
 ---
 
-## **4. Key Algorithms & Techniques**
-
-| Module                | Technique                                              | Purpose                                       |
-| --------------------- | ------------------------------------------------------ | --------------------------------------------- |
-| Preprocessing         | Adaptive thresholding, CLAHE, morphological closing    | Enhance contrast, remove noise, connect lines |
-| Grid Detection        | Contour approximation, Hough transform, Harris corners | Locate grid and find precise corners          |
-| Perspective Transform | Homography, bilinear interpolation                     | Straighten skewed grid                        |
-| OCR                   | Template matching, NCC, connected components           | Recognize digits without ML                   |
-| Solver                | Backtracking with constraint checking                  | Solve valid Sudoku puzzles                    |
-
----
-
-## **5. Command-Line Usage**
+## 5) Usage & CLI
 
 ```bash
-# Process a Sudoku image
-python -m src.sudoku_solver --image puzzle.jpg --output results/
+# Full pipeline on a photo
+python -m src.sudoku_solver --image 01.jpg --output output/
 
-# Skip intermediate saves
-python -m src.sudoku_solver --image puzzle.jpg --no-save
+# Change straightened grid size (default 450)
+python -m src.sudoku_solver --image 01.jpg --size 600
 
-# Direct OCR on binary grid (skip detection)
+# Skip saving intermediates
+python -m src.sudoku_solver --image 01.jpg --no-save
+
+# OCR only on a pre-straightened binary grid (digits white on black)
 python -m src.sudoku_solver --image binary_grid.png --binary-grid
-```
+``` 
+
+Dependencies: `pip install -r requirements.txt`.
 
 ---
 
-## **6. Robustness Features**
-
-- **Adaptive noise removal**: Detects Gaussian vs. salt-and-pepper noise, applies appropriate filters.
-- **Multiple detection fallbacks**: Contour + line-based hybrid with quality scoring.
-- **Grid completion**: Fills missing lines post-straightening.
-- **Polarity correction**: Automatically flips white-on-black images.
-- **Duplicate removal**: Resolves OCR conflicts via confidence scores.
-
----
-
-## **7. Limitations & Assumptions**
-
-1. **Grid must be visible**: The Sudoku grid should be the largest quadrilateral in the image.
-2. **Moderate skew**: Extreme perspective (>45°) may fail.
-3. **Digit clarity**: Handwritten or heavily degraded digits may reduce OCR accuracy.
-4. **Lighting**: Works best with uniform illumination, but adapts via local normalization.
+## 6) Outputs
+- `_original.jpg`: resized input.  
+- `_preprocessed.jpg`: binary mask used for detection/OCR.  
+- `_contour_detection.jpg`: detected contour or line-corner overlay.  
+- `_grid_9x9_visualization.jpg`: expected line overlay on detected quad.  
+- `_straightened.jpg`: warped, brightness-enhanced color grid.  
+- `_straightened_binary.jpg`: warped binary grid; `_reinforced` variant when gaps were filled.  
+- `_cells/` (optional): per-cell crops used in OCR.  
+- `_solved_overlay.jpg`: solution rendered over the straightened grid.
 
 ---
 
-## **8. Dependencies**
-
-- OpenCV ≥ 4.8.0
-- NumPy ≥ 1.24.0
-- Matplotlib ≥ 3.7.0 (for optional visualization)
-
-Install via:
-
-```bash
-pip install -r requirements.txt
-```
+## 7) Troubleshooting & Tips
+- **Grid not found**: ensure Sudoku is the largest quadrilateral; improve contrast; reduce perspective (>45° tilt can fail).  
+- **Warp looks skewed**: check squareness message; low transform quality means corner detection was weak—retake with better framing.  
+- **Missing lines post-warp**: enable saving intermediates to see `_reinforced` output; reinforcement fills gaps if coverage is low.  
+- **OCR errors**: check cell crops; add or regenerate templates in `digit_templates/`; ambiguous digits with low gap may zero-out.  
+- **Low givens warning**: <15 detected digits often signal poor OCR; fix detection before trusting solves.  
+- **Unsolved puzzle**: message will state whether search capped out or givens were invalid (duplicates).
 
 ---
 
-## **9. Conclusion**
+## 8) Extending or Reusing
+- Swap OCR: plug `ocr_pattern.match_cell` for stricter single-cell checks or integrate a different matcher at `extract_grid_digits`.  
+- Tune reinforcement: thresholds in `reinforce_grid_adaptive`/`reinforce_grid_morphological` control how aggressively lines are filled.  
+- Adjust solver: change `max_steps` in `solve_puzzle` or swap in a constraint-propagation solver.  
+- Instrumentation: use `visualize_transformation` or saved intermediates for notebook-style reports.
 
-This project demonstrates a full computer vision pipeline for solving Sudoku puzzles from images. It combines traditional CV techniques (filtering, morphology, Hough transform, homography) with simple pattern matching for OCR, avoiding machine learning as per project requirements. The system is robust to noise, skew, and lighting variations, producing accurate solutions for clear, well-framed Sudoku images.
+---
+
+## 9) Limitations & Assumptions
+- Sudoku grid should be dominant and reasonably axis-aligned; extreme perspective or heavy occlusion can defeat both detectors.  
+- Handwritten/stylized digits outside the template family may require new templates or relaxed thresholds.  
+- Rotation correction is conservative; slight residual skew may remain if Hough evidence is weak.  
+- Works best with even lighting; severe shadows can force aggressive thresholding that erodes thin strokes.
+
+---
+
+
+## 10) Conclusion
+
+This project demonstrates a full classical-CV pipeline that starts with a noisy photo and ends with a solved Sudoku rendered back onto the grid—without relying on trained models. Robust preprocessing, redundant grid detection, perspective correction, line reinforcement, and template-driven OCR work together to handle real-world artifacts like uneven lighting, partial line breaks, and moderate skew. The modular design (separable OCR, reinforcement, solver, and CLI) makes it easy to tune thresholds, swap components, or port the pipeline to other structured-grid problems. Continued refinement can focus on richer templates for handwritten digits, smarter conflict resolution, and tighter quality gating to make the solver even more tolerant of challenging captures.  

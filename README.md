@@ -350,7 +350,7 @@ The detector also runs a line-based path using probabilistic Hough to recover co
 
 ### Performance
 
-- **Typical processing time**: sub-second to a few seconds per image on the provided samples (hardware-dependent)
+- **Typical processing time**: 30 to 40 seconds per image on the provided samples (hardware-dependent)
 
 ### Output Examples
 

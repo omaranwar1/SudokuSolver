@@ -102,7 +102,7 @@ Milestone 2 extends the pipeline to run OCR, resolve conflicts, and output a sol
            ▼
 ┌────────────────────────┐
 │ Template OCR           │ - multi-font templates + stroke aug
-│ (IoU + hole penalty)   │ - shift/scale search per cell
+│ (overlap + hole pen.)  │ - shift/scale search per cell
 └──────────┬─────────────┘
            │ conflict cleanup & fallback corners
            ▼
@@ -128,7 +128,7 @@ Corner detection runs contour-first (largest contour + corner approximation) and
 **Steps**:
 - Reinforce weak/missing lines by scanning the 10 expected grid positions in each direction, then strip grid lines before OCR.
 - Split into 9x9 cells (50x50 crops), clear borders, and reject empties using coverage + component heuristics; recenters the main blob when safe.
-- Score candidates against multi-font templates using overlap/IoU with a hole-count penalty; searches small shift/scale/polarity variations per cell.
+- Score candidates against multi-font templates using overlap scoring with a hole-count penalty; searches small shift/scale/polarity variations per cell.
 - Resolve duplicates with `resolve_conflicts`; if contour-based OCR shows conflicts, reruns OCR on line-detected corners and keeps the board with fewer conflicts/more givens.
 - Optional debug crops saved to `output/{image}_cells/` (and `{image}_cells_line/` when the fallback path runs).
 
@@ -334,7 +334,7 @@ The detector also runs a line-based path using probabilistic Hough to recover co
 **Algorithm**:
 - **Grid conditioning**: Fill missing lines via expected-position scan, then remove grid lines using directional morphology to isolate digits.
 - **Cell processing**: Split into 9x9 cells (50×50), clear borders, reject empty cells with coverage/component checks, and recenter the main blob when safe.
-- **Template matching**: Compare against multi-font templates (with dilated/eroded variants) using overlap/IoU plus a hole-count penalty to separate shapes like 6/8/9. Searches small shift/scale/polarity variants per cell to absorb misalignment.
+- **Template matching**: Compare against multi-font templates (with dilated/eroded variants) using overlap scoring plus a hole-count penalty to separate shapes like 6/8/9. Searches small shift/scale/polarity variants per cell to absorb misalignment.
 - **Conflict cleanup**: `resolve_conflicts` drops duplicates/low-confidence hits; if contour-based OCR shows conflicts, OCR reruns with line-detected corners and keeps the cleaner board.
 
 ### 6. Sudoku Solving & Visualization (Milestone 2)

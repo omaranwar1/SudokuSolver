@@ -10,18 +10,12 @@ import sys
 
 from .preprocessing import preprocess_image, resize_image
 from .grid_detection import (
-    find_largest_contour,
-    find_grid_corners,
     draw_contour_and_corners,
     validate_grid_is_square,
     draw_9x9_grid_lines,
     detect_grid_hybrid,
     detect_grid_using_lines,
-    draw_template_grid,
-    reinforce_grid_morphological,
-    reinforce_grid_hough,
     reinforce_grid_adaptive,
-    detect_blocked_corners
 )
 from .perspective_transform import perspective_transform, get_transform_quality_score
 from .ocr import extract_grid_digits, format_board, render_solution_on_image, resolve_conflicts

@@ -8,6 +8,7 @@
 - [Overview](#overview)
 - [Project Milestones](#project-milestones)
 - [Milestone 1 Implementation](#milestone-1-implementation)
+- [Milestone 2 Implementation](#milestone-2-implementation)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Technical Implementation](#technical-implementation)
@@ -26,6 +27,12 @@ The project demonstrates practical applications of:
 - Geometric transformations
 - Pattern matching for OCR (Milestone 2)
 
+## Project Milestones
+
+- **Milestone 1**: Robust grid detection and perspective normalization to produce a clean 450x450 Sudoku grid (contour-based with Hough fallback).
+- **Milestone 2**: OCR + solving pipeline with template-based digit recognition, conflict cleanup, and solution rendering on the straightened grid.
+
+## Milestone 1 Implementation
 
 ### Processing Pipeline
 
@@ -72,6 +79,67 @@ The Milestone 1 pipeline consists of five main stages:
 └─────────────────┘
 ```
 
+During processing, the solver runs both contour-based detection (preferred) and a line-based Hough variant; it keeps the contour corners when available, falls back to line-based corners if contour detection fails, and may reuse the line-based corners later if OCR shows conflicts.
+
+## Milestone 2 Implementation
+
+Milestone 2 extends the pipeline to run OCR, resolve conflicts, and output a solved Sudoku.
+
+### Extended Pipeline
+
+```
+┌────────────────────────┐
+│ Straightened Binary    │
+│ Grid (450x450)         │
+└──────────┬─────────────┘
+           │ reinforce + clean lines
+           ▼
+┌────────────────────────┐
+│ Cell Extraction        │ - 9x9 split
+│ (50x50 crops)          │ - border clearing + save crops
+└──────────┬─────────────┘
+           │
+           ▼
+┌────────────────────────┐
+│ Template OCR           │ - multi-font templates + stroke aug
+│ (IoU + hole penalty)   │ - shift/scale search per cell
+└──────────┬─────────────┘
+           │ conflict cleanup & fallback corners
+           ▼
+┌────────────────────────┐
+│ Sudoku Solver          │ - validate givens
+│ + Solution Overlay     │ - backtracking with step cap
+└────────────────────────┘
+```
+
+Corner detection runs contour-first (largest contour + corner approximation) and falls back to the Hough line-based corners when contours fail or when OCR needs a cleaner set of corners.
+
+### Digit Template Generation
+
+**Purpose**: Provide stable reference digits for template matching.
+**Details**:
+- `python -m src.generate_digit_templates` renders 50x50 PNGs for digits 1-9 into `digit_templates/` using bundled bold fonts (DejaVu Sans, Albert Sans, Noto Sans JP, Lato).
+- Each template is centered and optionally augmented with eroded/dilated strokes to absorb stroke width changes during scanning.
+- OCR fails fast with a clear error if any digit templates are missing.
+
+### OCR Pipeline
+
+**Purpose**: Convert the straightened binary grid into a reliable 9x9 numeric board.
+**Steps**:
+- Reinforce weak/missing lines by scanning the 10 expected grid positions in each direction, then strip grid lines before OCR.
+- Split into 9x9 cells (50x50 crops), clear borders, and reject empties using coverage + component heuristics; recenters the main blob when safe.
+- Score candidates against multi-font templates using overlap/IoU with a hole-count penalty; searches small shift/scale/polarity variations per cell.
+- Resolve duplicates with `resolve_conflicts`; if contour-based OCR shows conflicts, reruns OCR on line-detected corners and keeps the board with fewer conflicts/more givens.
+- Optional debug crops saved to `output/{image}_cells/` (and `{image}_cells_line/` when the fallback path runs).
+
+### Sudoku Solving & Rendering
+
+**Purpose**: Deliver the solved puzzle alongside visual feedback.
+**Details**:
+- Backtracking solver in `src/solver.py` validates givens and caps search steps (default 200k) before attempting a solution.
+- Successful solves render digits back onto the straightened image as `{image}_solved_overlay.jpg` and print the board plus any cleaned conflicts to the console.
+- CLI options: `--no-save` to skip intermediate exports, `--binary-grid` to feed an already straightened binary grid directly into OCR/solving.
+
 ## Installation
 
 ### Requirements
@@ -103,54 +171,60 @@ The Milestone 1 pipeline consists of five main stages:
 
 ### Basic Usage
 
-Process a single image:
+Process a single image (runs OCR + solver and saves intermediates):
 
 ```bash
 python process_image.py --image 01.jpg
 ```
 
-Or using the module:
+Or call the module directly:
 
 ```bash
 python -m src.sudoku_solver --image 01.jpg
 ```
+
+Optional flags:
+
+```bash
+python -m src.sudoku_solver --image 01.jpg --size 600      # change straightened grid size (default 450)
+python -m src.sudoku_solver --image 01.jpg --no-save       # skip saving intermediate images/cell crops
+python -m src.sudoku_solver --binary-grid path/to/grid.png # OCR-only on a pre-straightened binary grid (prints board, no solve/overlay)
 ```
 
 ### Output Files
 
-The application generates the following outputs in the `output/` directory:
+When saving is enabled (default), the application writes the following to the `output/` directory:
 
 - `{image}_original.jpg` - Resized original image
 - `{image}_preprocessed.jpg` - Binary preprocessed image
 - `{image}_contour_detection.jpg` - Detected contour and corners
+- `{image}_enhanced_gray.jpg` - Brightness-normalized grayscale used for straightening
 - `{image}_straightened.jpg` - Final straightened color grid
 - `{image}_straightened_binary.jpg` - Binary straightened grid (for OCR)
+- `{image}_grid_9x9_visualization.jpg` - Grid lines drawn on the detected corners
+- `{image}_straightened_binary_reinforced.jpg` - Binary grid with missing lines filled (when needed)
+- `{image}_solved_overlay.jpg` - Solution rendered on the straightened grid (when solvable)
+- `{image}_cells/` (and `{image}_cells_line/` when fallback is used) - 50x50 crops for each cell used by the OCR
+- Line-based fallback (only when invoked): `{image}_straightened_line.jpg`, `{image}_straightened_binary_line.jpg`, `{image}_straightened_binary_line_reinforced.jpg`
 
 ## Technical Implementation
 
 ### 1. Image Preprocessing
 
-**Purpose**: Prepare the image for reliable grid detection by reducing noise and enhancing features.
+**Purpose**: Prepare the image for reliable grid detection by reducing noise, normalizing brightness, and connecting grid lines.
 
 **Techniques**:
 
 - **Grayscale Conversion**: Reduces 3-channel RGB to single intensity channel
   - Formula: `Gray = 0.299*R + 0.587*G + 0.114*B`
 
-- **Gaussian Blur**: Reduces noise while preserving edges
-  - Kernel size: 9×9
-  - Removes high-frequency noise from camera sensor
+- **Noise + Brightness Handling**: Estimate noise (Laplacian variance) and type (Gaussian vs salt/pepper) to pick a denoise path (fastNlMeans + bilateral for Gaussian; median/bilateral for salt/pepper). Apply brightness normalization/gamma and optional inversion when the input is white-on-black.
 
-- **Adaptive Thresholding**: Creates binary image robust to lighting variations
-  - Method: `ADAPTIVE_THRESH_GAUSSIAN_C`
-  - Block size: 11×11 pixels
-  - Constant: C=2
-  - Inverted: Grid lines become white (foreground)
+- **Smoothing + Thresholding**: Gaussian blur (5×5) followed by either standard adaptive thresholding (15×15, C=3, inverted) or a subimage-based adaptive path on very noisy inputs.
 
-- **Morphological Closing**: Fills small gaps in grid lines
-  - Operation: Dilation followed by erosion
-  - Kernel: 3×3 rectangular structuring element
-  - Iterations: 1
+- **Grid Completion**: Horizontal/vertical morphology (open + dilate) blended back into the binary to reconnect broken grid lines, then light open/close cleanup.
+
+- **Rotation Check**: Detects coarse rotation; when rotation is detected, reprocesses (denoise → normalize → threshold → grid completion) on the rotated view.
 
 **References**:
 - Gonzalez & Woods, "Digital Image Processing" (4th Edition), Chapters 3, 9
@@ -172,8 +246,8 @@ The application generates the following outputs in the `output/` directory:
    - Approximate contour to polygon using Douglas-Peucker algorithm
 
 3. **Validation**:
-   - Accept contours with 4-8 vertices (accounts for perspective distortion)
-   - Select largest valid contour as the Sudoku grid
+   - Accept contours with at least 4 vertices (accounts for perspective distortion)
+   - Select the first area-qualified contour as the Sudoku grid
 
 **References**:
 - Suzuki & Abe, "Topological Structural Analysis of Digitized Binary Images" (1985)
@@ -190,22 +264,12 @@ The application generates the following outputs in the `output/` directory:
    - Uses Sklansky's algorithm (1982)
 
 2. **Quadrilateral Approximation**
-   - If exactly 4 points: use directly
-   - Otherwise: find 4 extreme points using coordinate analysis
+   - Multi-pass approximation on the convex hull; if 5-6 points appear, merge closest pairs; otherwise fall back to extreme-point selection
 
 3. **Corner Ordering**
    - Order: Top-Left, Top-Right, Bottom-Right, Bottom-Left
-   - Method: Calculate angles from center point
+   - Method: Sort by angle around the contour centroid, then normalize to a consistent TL→TR→BR→BL order
    - Essential for correct perspective transformation
-
-**Corner Selection Logic**:
-```python
-# Find extreme corners based on coordinate sums/differences
-Top-Left:     min(x + y)  # Closest to origin
-Top-Right:    min(y - x)  # Top edge, rightmost
-Bottom-Right: max(x + y)  # Farthest from origin
-Bottom-Left:  min(x - y)  # Left edge, bottommost
-```
 
 ### 4. Perspective Transformation
 
@@ -241,33 +305,52 @@ where (x'/w', y'/w') is the transformed point
 **Quality Assessment**:
 - Calculate aspect ratios of detected quadrilateral
 - Score range: 0.0 (poor) to 1.0 (perfect square)
-- Typical acceptable threshold: ≥0.70
+- Quality score is logged to guide debugging (higher is closer to square)
 
 **References**:
 - Hartley & Zisserman, "Multiple View Geometry in Computer Vision" (2004), Chapter 4
 - Szeliski, "Computer Vision: Algorithms and Applications" (2010)
 - OpenCV Documentation: [Geometric Transformations](https://docs.opencv.org/4.x/da/d6e/tutorial_py_geometric_transformations.html)
 
-### Alternative Method: Hough Transform
+### Alternative Method: Line-Based Grid Detection (Hough Transform)
 
-While the primary implementation uses contour detection, the codebase also includes **Hough Line Transform** as an alternative approach:
+The detector also runs a line-based path using probabilistic Hough to recover corners when contours are weak.
 
-**Purpose**: Detect straight lines in the image to find grid structure.
+**Purpose**: Detect straight lines to infer grid boundaries.
 
-**Parameters**:
-- ρ (rho): 1 pixel resolution
-- θ (theta): 1 degree resolution (π/180)
-- Threshold: 200 votes minimum
+**Approach**:
+- Probabilistic Hough (two passes: threshold≈100, then 50 if weak) with `minLineLength` ≈ 0.3×min(image dimension) in the first pass (≈0.2× in the fallback) and `maxLineGap` 20–30.
+- Classify horizontal/vertical lines, cluster into up to 10 per direction, and take outermost clusters as boundaries.
+- Optional slope-consistency check refines corners from averaged line equations when the aspect ratio stays near-square.
 
 **References**:
 - Hough, P.V.C., "Method and means for recognizing complex patterns" (1962)
 - Duda & Hart, "Use of the Hough transformation to detect lines and curves in pictures" (1972)
 
+### 5. Digit Extraction & OCR (Milestone 2)
+
+**Purpose**: Convert the straightened binary grid into a reliable 9x9 board of digits.
+
+**Algorithm**:
+- **Grid conditioning**: Fill missing lines via expected-position scan, then remove grid lines using directional morphology to isolate digits.
+- **Cell processing**: Split into 9x9 cells (50×50), clear borders, reject empty cells with coverage/component checks, and recenter the main blob when safe.
+- **Template matching**: Compare against multi-font templates (with dilated/eroded variants) using overlap/IoU plus a hole-count penalty to separate shapes like 6/8/9. Searches small shift/scale/polarity variants per cell to absorb misalignment.
+- **Conflict cleanup**: `resolve_conflicts` drops duplicates/low-confidence hits; if contour-based OCR shows conflicts, OCR reruns with line-detected corners and keeps the cleaner board.
+
+### 6. Sudoku Solving & Visualization (Milestone 2)
+
+**Purpose**: Solve the detected puzzle and present the answer visually.
+
+**Algorithm**:
+- Validate givens (rows/cols/blocks) before solving to short-circuit impossible puzzles.
+- Backtracking solver (`solve_puzzle`) with a configurable step cap (default: 200k expansions) to avoid runaway searches.
+- Renders the solved digits onto the straightened grid (`{image}_solved_overlay.jpg`) while keeping the detected givens untouched; cell crops and overlays are saved when intermediate exports are enabled.
+
 ## Results
 
 ### Performance
 
-- **Average processing time**: ~0.5-1 second per image
+- **Typical processing time**: sub-second to a few seconds per image on the provided samples (hardware-dependent)
 
 ### Output Examples
 
@@ -275,6 +358,7 @@ After processing, each image generates:
 1. **Preprocessed binary image** - Shows cleaned, thresholded grid
 2. **Contour detection** - Visualizes detected boundary and corners
 3. **Straightened grid** - Final 450×450 normalized output
+4. **Solved overlay** - Solution digits rendered on the straightened grid (when solvable)
 
 ## References
 
@@ -319,20 +403,3 @@ After processing, each image generates:
    - [Homography](https://en.wikipedia.org/wiki/Homography_(computer_vision))
    - [Perspective Transform](https://en.wikipedia.org/wiki/Perspective_transform)
    - [Adaptive Thresholding](https://en.wikipedia.org/wiki/Thresholding_(image_processing))
-
-## Future Work
-
-### Milestone 2 Tasks
-
-1. **Optical Character Recognition (OCR)**:
-   - Implement pattern matching for digit recognition (1-9)
-   - Extract digits from each cell of the straightened grid
-   - Handle empty cells correctly
-
-2. **Sudoku Solving Algorithm**:
-   - Integrate existing solving algorithm (backtracking or constraint propagation)
-   - Validate extracted puzzle before solving
-   - Handle invalid/unsolvable puzzles gracefully
-
-
-

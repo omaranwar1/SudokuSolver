@@ -10,19 +10,16 @@ import sys
 
 from .preprocessing import preprocess_image, resize_image
 from .grid_detection import (
-    find_largest_contour,
-    find_grid_corners,
     draw_contour_and_corners,
     validate_grid_is_square,
     draw_9x9_grid_lines,
+    detect_grid_hybrid,
     detect_grid_using_lines,
-    draw_template_grid,
-    reinforce_grid_morphological,
-    reinforce_grid_hough,
     reinforce_grid_adaptive,
-    detect_blocked_corners
 )
 from .perspective_transform import perspective_transform, get_transform_quality_score
+from .ocr import extract_grid_digits, format_board, render_solution_on_image, resolve_conflicts
+from .solver import solve_puzzle
 
 
 class SudokuSolver:
@@ -77,6 +74,7 @@ class SudokuSolver:
         original = resize_image(original, max_width=800)
         self.intermediate_images['original'] = original
         print(f"      Image size: {original.shape[1]}x{original.shape[0]}")
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
 
         print("\n[2/5] Preprocessing image...")
         print("      Using advanced preprocessing pipeline:")
@@ -99,31 +97,33 @@ class SudokuSolver:
         contour_result = None
         line_result = None
 
-        print("\n      [Method 1] Contour detection...")
-        contour = find_largest_contour(processed)
+        print("\n      [Method 1] Hybrid detection (minAreaRect + Hough fallback)...")
+        corners_hybrid, contour = detect_grid_hybrid(processed, debug=False)
 
-        if contour is not None:
-            area = cv2.contourArea(contour)
-            print(f"        ✓ Contour found (area: {area:.0f} pixels)")
+        if corners_hybrid is not None:
+            if contour is not None:
+                area = cv2.contourArea(contour)
+                image_area = processed.shape[0] * processed.shape[1]
+                coverage_contour = area / image_area
+            else:
+                area = 0
+                coverage_contour = 0
 
-            corners_contour = find_grid_corners(contour)
-            quality_contour = get_transform_quality_score(corners_contour)
-            is_square_c, aspect_ratio_c, _ = validate_grid_is_square(corners_contour)
+            quality_contour = get_transform_quality_score(corners_hybrid)
+            is_square_c, aspect_ratio_c, _ = validate_grid_is_square(corners_hybrid)
 
-            image_area = processed.shape[0] * processed.shape[1]
-            coverage_contour = area / image_area
-
+            print(f"        ✓ Hybrid corners found (area: {area:.0f} pixels)")
             print(f"        Quality: {quality_contour:.3f}, Ratio: {aspect_ratio_c:.3f}, Coverage: {coverage_contour:.3f}")
 
             contour_result = {
-                'corners': corners_contour,
+                'corners': corners_hybrid,
                 'quality': quality_contour,
                 'aspect_ratio': aspect_ratio_c,
                 'coverage': coverage_contour,
                 'contour': contour
             }
         else:
-            print(f"        ✗ No contour found")
+            print(f"        ✗ Hybrid detection failed")
 
         print("\n      [Method 2] Line-based detection (Hough Transform)...")
         corners_lines = detect_grid_using_lines(processed, debug=False)
@@ -158,72 +158,17 @@ class SudokuSolver:
             cv2.imwrite('debug_preprocessed_failed.jpg', processed)
             return None
 
-        if contour_result is None:
-            corners = line_result['corners']
-            detection_method = "line-based"
-            contour = None
-            print(f"\n      ✓ Selected: Line-based (only method that succeeded)")
-        elif line_result is None:
+        # Prefer contour-based corners for OCR/perspective; fall back to lines only if contour fails.
+        if contour_result is not None:
             corners = contour_result['corners']
-            detection_method = "contour-based"
+            detection_method = "contour-based (preferred)"
             contour = contour_result['contour']
-            print(f"\n      ✓ Selected: Contour-based (only method that succeeded)")
+            print(f"\n      ✓ Selected: Contour-based (preferred)")
         else:
-            print(f"\n      [Adaptive Selection] Comparing methods...")
-
-            def calculate_score(result):
-                quality_score = result['quality']
-                ratio_score = 1.0 - abs(1.0 - result['aspect_ratio'])
-                ratio_score = max(0, ratio_score)
-                coverage_score = min(result['coverage'], 1.0)
-
-                composite = (quality_score * 0.5 +
-                           ratio_score * 0.3 +
-                           coverage_score * 0.2)
-                return composite
-
-            score_contour = calculate_score(contour_result)
-            score_lines = calculate_score(line_result)
-
-            print(f"        Contour score: {score_contour:.3f} (q={contour_result['quality']:.3f}, r={contour_result['aspect_ratio']:.3f}, c={contour_result['coverage']:.3f})")
-            print(f"        Line score:    {score_lines:.3f} (q={line_result['quality']:.3f}, r={line_result['aspect_ratio']:.3f}, c={line_result['coverage']:.3f})")
-
-            score_diff = score_lines - score_contour
-            BIAS_THRESHOLD = 0.075
-
-            if score_diff > BIAS_THRESHOLD:
-                corners = line_result['corners']
-                detection_method = "line-based"
-                contour = None
-                print(f"      ✓ Selected: Line-based (score {score_lines:.3f} > {score_contour:.3f} + {BIAS_THRESHOLD})")
-            else:
-                is_blocked, block_reason = detect_blocked_corners(
-                    contour_result['corners'],
-                    line_result['corners'],
-                    processed,
-                    debug=True
-                )
-
-                if not is_blocked:
-                    corners = contour_result['corners']
-                    detection_method = "contour-based"
-                    contour = contour_result['contour']
-                    print(f"      ✓ Selected: Contour-based (passes bias; no blockage detected)")
-                else:
-                    print(f"\n      ! Corner displacement detected: {block_reason}")
-                    coverage_diff = line_result['coverage'] - contour_result['coverage']
-                    COVERAGE_THRESHOLD = 0.20
-
-                    if coverage_diff < COVERAGE_THRESHOLD:
-                        corners = line_result['corners']
-                        detection_method = "line-based"
-                        contour = None
-                        print(f"      ✓ Selected: Line-based (blocked corner + small coverage gap {coverage_diff:.3f} < {COVERAGE_THRESHOLD})")
-                    else:
-                        corners = contour_result['corners']
-                        detection_method = "contour-based"
-                        contour = contour_result['contour']
-                        print(f"      ✓ Selected: Contour-based (blocked corner + large coverage gap {coverage_diff:.3f} >= {COVERAGE_THRESHOLD})")
+            corners = line_result['corners']
+            detection_method = "line-based (fallback)"
+            contour = None
+            print(f"\n      ✓ Selected: Line-based (contour unavailable)")
 
         print("\n[4/5] Corners identified...")
         print(f"      Detection method: {detection_method}")
@@ -281,6 +226,87 @@ class SudokuSolver:
             print(f"      ✓ Grid reinforcement applied")
         else:
             print(f"      ✓ Grid is complete, no reinforcement needed")
+
+        print("\n[6/6] OCR (pattern matching) and solving...")
+        cells_dir = None
+        if self.save_intermediate:
+            cells_dir = os.path.join(output_dir, f"{base_name}_cells")
+        # Contour-first OCR
+        board_raw_c, scores_c = extract_grid_digits(final_binary, save_cells_dir=cells_dir)
+        board_c, conflicts_c = resolve_conflicts(board_raw_c, scores_c)
+        contour_candidate = {
+            "board": board_c,
+            "conflicts": conflicts_c,
+            "scores": scores_c,
+            "final_binary": final_binary,
+            "straightened": straightened,
+            "label": "contour-based",
+        }
+
+        # If contour OCR has conflicts, try line-based OCR and pick the one with fewer conflicts.
+        line_candidate = None
+        if line_result is not None and contour_candidate["conflicts"]:
+            print("\n      Contour OCR has conflicts; trying line-based corners for comparison...")
+            straightened_line = perspective_transform(enhanced_gray_3ch, line_result['corners'], self.output_size)
+            straightened_binary_line = perspective_transform(processed, line_result['corners'], self.output_size)
+            final_binary_line = reinforce_grid_adaptive(straightened_binary_line, self.output_size)
+
+            if self.save_intermediate:
+                self.intermediate_images['straightened_line'] = straightened_line
+                self.intermediate_images['straightened_binary_line'] = straightened_binary_line
+                self.intermediate_images['straightened_binary_line_reinforced'] = final_binary_line
+
+            cells_dir_line = None
+            if self.save_intermediate:
+                cells_dir_line = os.path.join(output_dir, f"{base_name}_cells_line")
+
+            board_raw_line, scores_line = extract_grid_digits(final_binary_line, save_cells_dir=cells_dir_line)
+            board_line, conflicts_line = resolve_conflicts(board_raw_line, scores_line)
+            line_candidate = {
+                "board": board_line,
+                "conflicts": conflicts_line,
+                "scores": scores_line,
+                "final_binary": final_binary_line,
+                "straightened": straightened_line,
+                "label": "line-based",
+            }
+
+        # Choose candidate with fewest conflicts (tie-break: more givens). Solve only after selection.
+        candidates = [contour_candidate] + ([line_candidate] if line_candidate is not None else [])
+        candidates = [c for c in candidates if c is not None]
+        candidates.sort(key=lambda c: (len(c["conflicts"]), -np.count_nonzero(c["board"])))
+        chosen = candidates[0]
+        board = chosen["board"]
+        conflict_notes = chosen["conflicts"]
+        final_binary = chosen["final_binary"]
+        chosen_straightened = chosen["straightened"]
+        if chosen["label"] != "contour-based":
+            detection_method = f"{chosen['label']} (fallback due to conflicts)"
+
+        print(f"\n      Detected puzzle ({chosen['label']}):")
+        print(format_board(board))
+        if conflict_notes:
+            print("      Note: cleaned duplicate detections:")
+            for note in conflict_notes:
+                print(f"        - {note}")
+
+        given_count = np.count_nonzero(board)
+        if given_count < 15:
+            print(f"      WARNING: Low number of detected givens ({given_count}); OCR may be unreliable")
+
+        solution, solve_msg = solve_puzzle(board)
+        if solution is None:
+            print(f"      ✗ Could not solve: {solve_msg}")
+            print("        (Check OCR accuracy or image quality)")
+        else:
+            print(f"      ✓ Solved puzzle ({solve_msg}):")
+            print(format_board(solution))
+            solved_overlay = render_solution_on_image(
+                chosen_straightened,
+                solution,
+                board
+            )
+            self.intermediate_images['solved_overlay'] = solved_overlay
 
         if self.save_intermediate:
             self._save_results(image_path, output_dir)
@@ -347,6 +373,8 @@ Examples:
                         help='Output grid size in pixels (default: 450)')
     parser.add_argument('--no-save', action='store_true',
                         help='Do not save intermediate images')
+    parser.add_argument('--binary-grid', action='store_true',
+                        help='Treat input image as an already straightened binary grid (skip detection)')
 
     args = parser.parse_args()
 
@@ -354,6 +382,29 @@ Examples:
     if not os.path.exists(args.image):
         print(f"Error: Image file not found: {args.image}")
         sys.exit(1)
+
+    # If user provides a pre-straightened binary grid, skip the full pipeline
+    if args.binary_grid:
+        img = cv2.imread(args.image, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            print(f"Error: Could not load binary grid from {args.image}")
+            sys.exit(1)
+        # Ensure binary polarity: digits white on black
+        _, bin_img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if bin_img.mean() > 127:
+            bin_img = cv2.bitwise_not(bin_img)
+        os.makedirs(args.output, exist_ok=True)
+        base = os.path.splitext(os.path.basename(args.image))[0]
+        cells_dir = os.path.join(args.output, f"{base}_cells")
+        board_raw, scores = extract_grid_digits(bin_img, save_cells_dir=cells_dir)
+        board, conflict_notes = resolve_conflicts(board_raw, scores)
+        print("\nDetected puzzle (binary input):")
+        print(format_board(board))
+        if conflict_notes:
+            print("Note: cleaned duplicate detections:")
+            for note in conflict_notes:
+                print(f"  - {note}")
+        sys.exit(0)
 
     # Create solver instance
     solver = SudokuSolver(
